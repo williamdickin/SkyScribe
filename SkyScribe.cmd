@@ -25,7 +25,7 @@ try {
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYCRIBE v17 (CLEAN) STARTED ===" -ForegroundColor Yellow
+    Write-Host "`n=== SKYSCRIBE v18 (STABLE) STARTED ===" -ForegroundColor Yellow
     Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -45,6 +45,7 @@ try {
         JumpGapMinutes    = 30
         MinFileSizeKB     = 100
         PreviewWidth      = 480
+        MaxParallelFfmpeg = 4
     }
 
     if (Test-Path $ConfigFile) {
@@ -67,7 +68,8 @@ try {
             "JumpGapMinutes=30",
             "VideoExtensions=.mp4,.mov,.3gp,.m4v,.mkv,.avi",
             "MinFileSizeKB=100",
-            "PreviewWidth=480"
+            "PreviewWidth=480",
+            "MaxParallelFfmpeg=4"
         )
         $Content | Set-Content $ConfigFile
     }
@@ -107,9 +109,10 @@ try {
     }
     if ($DateIdx -eq 0) { $DateIdx = 4 }; if ($DurIdx -eq 0) { $DurIdx = 27 }
 
-    # --- 6. PREFETCH ENGINE ---
+    # --- 6. PREFETCH ENGINE (FIXED CRASH) ---
     $PreviewJobScript = {
-        param($FFmpegPath, $InputFile, $DurationStr, $BaseTempPath, $UniqueId, $CfgSkip, $CfgWindow, $CfgFrames, $CfgWidth)
+        param($FFmpegPath, $InputFile, $DurationStr, $BaseTempPath, $UniqueId, $CfgSkip, $CfgWindow, $CfgFrames, $CfgWidth, $MaxParallel)
+        
         if ($DurationStr -match "(\d+):(\d+):(\d+)") { $TotalSecs = ([int]$matches[1] * 3600) + ([int]$matches[2] * 60) + [int]$matches[3] } else { return $null }
         $OutDir = Join-Path $BaseTempPath $UniqueId
         if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
@@ -122,14 +125,33 @@ try {
         
         $RunningProcs = @()
         for ($i=1; $i -le $CfgFrames; $i++) {
+            # FIX 1: Robust throttling loop that handles exited processes safely
+            while (($RunningProcs | Where-Object { 
+                try { -not $_.HasExited } catch { $false } 
+            }).Count -ge $MaxParallel) { 
+                Start-Sleep -Milliseconds 50 
+            }
+
             $PadNum = $i.ToString("00")
             $OutFile = Join-Path $OutDir "frame_$PadNum.jpg"
             $Offset = [math]::Round($Interval * $i); $FinalTime = $StartTime + $Offset
             $Args = "-ss $FinalTime -i `"$InputFile`" -frames:v 1 -vf scale=${CfgWidth}:-1 -q:v 5 -y `"$OutFile`""
+            
             $p = Start-Process -FilePath $FFmpegPath -ArgumentList $Args -WindowStyle Hidden -PassThru
             $RunningProcs += $p
         }
-        if ($RunningProcs.Count -gt 0) { Wait-Process -InputObject $RunningProcs }
+
+        # FIX 2: Manual Wait Loop instead of 'Wait-Process'
+        # This prevents the "Process has exited" crash if FFmpeg finishes too fast
+        while (($RunningProcs | Where-Object { 
+            try { -not $_.HasExited } catch { $false } 
+        }).Count -gt 0) { 
+            Start-Sleep -Milliseconds 50 
+        }
+        
+        # Cleanup Handles
+        foreach ($p in $RunningProcs) { try { $p.Dispose() } catch {} }
+        
         return $OutDir
     }
 
@@ -141,7 +163,7 @@ try {
             foreach ($f in $Files) {
                 try {
                     $Bytes = [System.IO.File]::ReadAllBytes($f.FullName)
-                    $Stream = New-Object System.IO.MemoryStream($Bytes, 0, $Bytes.Length)
+                    $Stream = New-Object System.IO.MemoryStream(,$Bytes)
                     $Loaded += [System.Drawing.Image]::FromStream($Stream)
                 } catch {}
             }
@@ -233,9 +255,12 @@ try {
         }
 
         $Result = $Form.ShowDialog()
-        if ($Result -eq "OK") { return @{ Status="RENAME"; FinalName=$PreviewBox.Text; Date=$DateIn.Text; Jump=$JumpIn.Text; Clip=$ClipIn.Text; People=$PeopleIn.Text; Desc=$DescIn.Text } }
-        if ($Result -eq "Ignore") { return @{ Status="SKIP" } }
-        return $null
+        $OutData = if ($Result -eq "OK") { @{ Status="RENAME"; FinalName=$PreviewBox.Text; Date=$DateIn.Text; Jump=$JumpIn.Text; Clip=$ClipIn.Text; People=$PeopleIn.Text; Desc=$DescIn.Text } }
+                   elseif ($Result -eq "Ignore") { @{ Status="SKIP" } }
+                   else { $null }
+
+        $Form.Dispose()
+        return $OutData
     }
 
     # --- 7. PROCESS LOOP ---
@@ -279,7 +304,7 @@ try {
         if ($FFmpegAvailable) {
             if ($i -eq 0) {
                 Write-Host "      [SYNC] Generating initial thumbnails..." -ForegroundColor Yellow
-                $Job = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $File.FullName, $Duration, $BaseTempPath, "0", $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth
+                $Job = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $File.FullName, $Duration, $BaseTempPath, "0", $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
                 $ResultDir = $Job | Receive-Job -Wait -AutoRemoveJob
                 Log-Time "Thumbnail Gen" $Sw
                 $Images = Load-ImagesFromFolder $ResultDir
@@ -300,7 +325,7 @@ try {
             $NextShell = $FolderObj.ParseName($NextFile.Name)
             $NextDur = $FolderObj.GetDetailsOf($NextShell, $DurIdx)
             $NextId = ($i + 1).ToString()
-            $NextJob = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $NextFile.FullName, $NextDur, $BaseTempPath, $NextId, $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth
+            $NextJob = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $NextFile.FullName, $NextDur, $BaseTempPath, $NextId, $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
             Write-Host "      [ASYNC] Prefetch started for next file." -ForegroundColor DarkGray
         } else { $NextJob = $null }
 
@@ -323,6 +348,12 @@ try {
         Log-Time "User Action" $Sw
 
         if ($Images) { foreach ($img in $Images) { $img.Dispose() } }
+        $Images = $null
+        
+        # MEMORY FIX: Garbage Collection
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+
         if ($null -eq $Data) { break }
         if ($Data.Status -eq "SKIP") { Log-Info "Skipped."; continue }
 
@@ -354,4 +385,8 @@ try {
     Write-Host "CRITICAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "Error Details: $($_.ScriptStackTrace)" -ForegroundColor Yellow
     pause
+} finally {
+    if ($null -ne $Shell) {
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Shell) | Out-Null
+    }
 }
