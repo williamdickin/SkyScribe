@@ -1,6 +1,7 @@
 <# : batch portion
 @echo off
 cd /d "%~dp0"
+:: Console stays open for logs
 mode con: cols=100 lines=30
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression (Get-Content '%~f0' -Raw)"
 if %errorlevel% neq 0 pause
@@ -21,13 +22,11 @@ try {
         Write-Host "${ms}ms" -ForegroundColor Green
     }
 
-    # SAFETY FIX: Sanitize filenames
     function Clean-FileName($Name) {
-        # Replace illegal chars (\ / : * ? " < > |) with a dash or underscore
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYCRIBE v14 (ROBUST) STARTED ===" -ForegroundColor Yellow
+    Write-Host "`n=== SKYCRIBE v15 (CHRONOLOGICAL) STARTED ===" -ForegroundColor Yellow
     Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -138,7 +137,6 @@ try {
     function Load-ImagesFromFolder {
         param($FolderPath)
         $Loaded = @()
-        $Streams = @() # Keep streams to dispose later if needed
         if ($FolderPath -and (Test-Path $FolderPath)) {
             $Files = Get-ChildItem -Path $FolderPath -Filter "*.jpg" | Sort-Object Name
             foreach ($f in $Files) {
@@ -146,8 +144,6 @@ try {
                     $Bytes = [System.IO.File]::ReadAllBytes($f.FullName)
                     $Stream = New-Object System.IO.MemoryStream($Bytes, 0, $Bytes.Length)
                     $Loaded += [System.Drawing.Image]::FromStream($Stream)
-                    # We do NOT dispose stream here, or image breaks. 
-                    # GC handles MemoryStreams reasonably well.
                 } catch {}
             }
         }
@@ -245,9 +241,21 @@ try {
 
     # --- 7. PROCESS LOOP ---
     $Sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $Files = $RawFiles | Sort-Object LastWriteTime
+    
+    # NEW: SORT FILES CHRONOLOGICALLY BY METADATA
+    Log-Info "Sorting selected files by Media Created date..."
+    $FilesWithDates = @()
+    foreach ($File in $RawFiles) {
+        $ShellFile = $FolderObj.ParseName($File.Name)
+        $RawDate = $FolderObj.GetDetailsOf($ShellFile, $DateIdx) -replace '[^0-9/ :APM]', ''
+        $RealDate = if ($RawDate -as [DateTime]) { [DateTime]$RawDate } else { $File.LastWriteTime }
+        $FilesWithDates += [PSCustomObject]@{ FileObject = $File; SortDate = $RealDate }
+    }
+    $Files = $FilesWithDates | Sort-Object SortDate | Select-Object -ExpandProperty FileObject
+    
     $GlobalDate = $null; $LastJump = ""; $LastJumpTime = $null; $LastPeople = ""; $LastDesc = ""
-    $NextJob = $null; $BaseTempPath = Join-Path $env:TEMP "SkydivePreviews"
+    $NextJob = $null
+    $BaseTempPath = Join-Path $env:TEMP "SkydivePreviews"
     if (Test-Path $BaseTempPath) { Remove-Item $BaseTempPath -Recurse -Force -ErrorAction SilentlyContinue }
     New-Item -ItemType Directory -Path $BaseTempPath -Force | Out-Null
 
