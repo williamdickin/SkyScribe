@@ -25,7 +25,7 @@ try {
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYSCRIBE v18 (STABLE) STARTED ===" -ForegroundColor Yellow
+    Write-Host "`n=== SKYSCRIBE v18 (MEMORY FIX + SMART WINDOW) STARTED ===" -ForegroundColor Yellow
     Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -39,8 +39,8 @@ try {
     # --- 2. CONFIGURATION ---
     $Config = @{
         SkipSeconds       = 15
-        WindowSeconds     = 90
-        FrameCount        = 15
+        WindowSeconds     = 60
+        FrameCount        = 10
         VideoExtensions   = ".mp4,.mov,.3gp,.m4v,.mkv,.avi"
         JumpGapMinutes    = 30
         MinFileSizeKB     = 100
@@ -63,8 +63,8 @@ try {
         $Content = @(
             "[SkyScribe Settings]",
             "SkipSeconds=15",
-            "WindowSeconds=90",
-            "FrameCount=15",
+            "WindowSeconds=60",
+            "FrameCount=10",
             "JumpGapMinutes=30",
             "VideoExtensions=.mp4,.mov,.3gp,.m4v,.mkv,.avi",
             "MinFileSizeKB=100",
@@ -109,7 +109,7 @@ try {
     }
     if ($DateIdx -eq 0) { $DateIdx = 4 }; if ($DurIdx -eq 0) { $DurIdx = 27 }
 
-    # --- 6. PREFETCH ENGINE (FIXED CRASH) ---
+    # --- 6. PREFETCH ENGINE (SMART WINDOW LOGIC) ---
     $PreviewJobScript = {
         param($FFmpegPath, $InputFile, $DurationStr, $BaseTempPath, $UniqueId, $CfgSkip, $CfgWindow, $CfgFrames, $CfgWidth, $MaxParallel)
         
@@ -118,19 +118,31 @@ try {
         if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-        $StartTime = $CfgSkip; $EndTime = $CfgSkip + $CfgWindow
-        if ($TotalSecs -lt $CfgSkip) { $StartTime = 0; $EndTime = $TotalSecs } else { if ($TotalSecs -lt $EndTime) { $EndTime = $TotalSecs } }
+        # --- LOGIC UPDATE STARTS HERE ---
+        $StartTime = $CfgSkip
+        $EndTime = $CfgSkip + $CfgWindow
+
+        if ($TotalSecs -lt $CfgWindow) {
+            # Case 1: File is shorter than the desired window (e.g. 40s file, 60s window)
+            # Action: Show everything from 0 to End. Ignore Skip.
+            $StartTime = 0
+            $EndTime = $TotalSecs
+        } elseif ($TotalSecs -lt $CfgSkip) {
+            # Case 2: File is incredibly short (shorter than Skip)
+            $StartTime = 0
+            $EndTime = $TotalSecs
+        } elseif ($TotalSecs -lt $EndTime) {
+            # Case 3: File is long enough to Skip, but ends before full Window finishes
+            $EndTime = $TotalSecs
+        }
+        # --- LOGIC UPDATE ENDS HERE ---
+
         $TimeWindow = $EndTime - $StartTime; if ($TimeWindow -le 0) { $TimeWindow = 1 }
         $Interval = $TimeWindow / ($CfgFrames + 1)
         
         $RunningProcs = @()
         for ($i=1; $i -le $CfgFrames; $i++) {
-            # FIX 1: Robust throttling loop that handles exited processes safely
-            while (($RunningProcs | Where-Object { 
-                try { -not $_.HasExited } catch { $false } 
-            }).Count -ge $MaxParallel) { 
-                Start-Sleep -Milliseconds 50 
-            }
+            while (($RunningProcs | Where-Object { try { -not $_.HasExited } catch { $false } }).Count -ge $MaxParallel) { Start-Sleep -Milliseconds 50 }
 
             $PadNum = $i.ToString("00")
             $OutFile = Join-Path $OutDir "frame_$PadNum.jpg"
@@ -141,15 +153,7 @@ try {
             $RunningProcs += $p
         }
 
-        # FIX 2: Manual Wait Loop instead of 'Wait-Process'
-        # This prevents the "Process has exited" crash if FFmpeg finishes too fast
-        while (($RunningProcs | Where-Object { 
-            try { -not $_.HasExited } catch { $false } 
-        }).Count -gt 0) { 
-            Start-Sleep -Milliseconds 50 
-        }
-        
-        # Cleanup Handles
+        while (($RunningProcs | Where-Object { try { -not $_.HasExited } catch { $false } }).Count -gt 0) { Start-Sleep -Milliseconds 50 }
         foreach ($p in $RunningProcs) { try { $p.Dispose() } catch {} }
         
         return $OutDir
@@ -350,7 +354,6 @@ try {
         if ($Images) { foreach ($img in $Images) { $img.Dispose() } }
         $Images = $null
         
-        # MEMORY FIX: Garbage Collection
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
 
