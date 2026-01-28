@@ -39,8 +39,8 @@ try {
     # --- 2. CONFIGURATION ---
     $Config = @{
         SkipSeconds       = 15
-        WindowSeconds     = 60
-        FrameCount        = 10
+        WindowSeconds     = 90
+        FrameCount        = 15
         VideoExtensions   = ".mp4,.mov,.3gp,.m4v,.mkv,.avi"
         JumpGapMinutes    = 30
         MinFileSizeKB     = 100
@@ -63,8 +63,8 @@ try {
         $Content = @(
             "[SkyScribe Settings]",
             "SkipSeconds=15",
-            "WindowSeconds=60",
-            "FrameCount=10",
+            "WindowSeconds=90",
+            "FrameCount=15",
             "JumpGapMinutes=30",
             "VideoExtensions=.mp4,.mov,.3gp,.m4v,.mkv,.avi",
             "MinFileSizeKB=100",
