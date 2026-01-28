@@ -1,7 +1,6 @@
 <# : batch portion
 @echo off
 cd /d "%~dp0"
-:: Console stays open for logs
 mode con: cols=100 lines=30
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression (Get-Content '%~f0' -Raw)"
 if %errorlevel% neq 0 pause
@@ -26,7 +25,7 @@ try {
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYCRIBE v15 (CHRONOLOGICAL) STARTED ===" -ForegroundColor Yellow
+    Write-Host "`n=== SKYCRIBE v17 (CLEAN) STARTED ===" -ForegroundColor Yellow
     Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -242,7 +241,6 @@ try {
     # --- 7. PROCESS LOOP ---
     $Sw = [System.Diagnostics.Stopwatch]::StartNew()
     
-    # NEW: SORT FILES CHRONOLOGICALLY BY METADATA
     Log-Info "Sorting selected files by Media Created date..."
     $FilesWithDates = @()
     foreach ($File in $RawFiles) {
@@ -253,9 +251,8 @@ try {
     }
     $Files = $FilesWithDates | Sort-Object SortDate | Select-Object -ExpandProperty FileObject
     
-    $GlobalDate = $null; $LastJump = ""; $LastJumpTime = $null; $LastPeople = ""; $LastDesc = ""
-    $NextJob = $null
-    $BaseTempPath = Join-Path $env:TEMP "SkydivePreviews"
+    $LastJump = ""; $LastJumpTime = $null; $LastPeople = ""; $LastDesc = ""
+    $NextJob = $null; $BaseTempPath = Join-Path $env:TEMP "SkydivePreviews"
     if (Test-Path $BaseTempPath) { Remove-Item $BaseTempPath -Recurse -Force -ErrorAction SilentlyContinue }
     New-Item -ItemType Directory -Path $BaseTempPath -Force | Out-Null
 
@@ -267,7 +264,15 @@ try {
         $ShellFile = $FolderObj.ParseName($File.Name)
         $RawDate = $FolderObj.GetDetailsOf($ShellFile, $DateIdx) -replace '[^0-9/ :APM]', ''
         $Duration = $FolderObj.GetDetailsOf($ShellFile, $DurIdx)
-        $CurrentMediaTime = if ($RawDate -as [DateTime]) { [DateTime]$RawDate } else { $File.LastWriteTime }
+        
+        if ($RawDate -as [DateTime]) {
+             $CurrentMediaTime = [DateTime]$RawDate
+             $SuggestedDate = $CurrentMediaTime.ToString("yyyy_MM_dd")
+        } else {
+             $CurrentMediaTime = $File.LastWriteTime 
+             $SuggestedDate = ""
+        }
+
         Log-Time "Metadata Read" $Sw
         $Images = @()
 
@@ -299,7 +304,6 @@ try {
             Write-Host "      [ASYNC] Prefetch started for next file." -ForegroundColor DarkGray
         } else { $NextJob = $null }
 
-        $SuggestedDate = if ($GlobalDate) { $GlobalDate } else { $CurrentMediaTime.ToString("yyyy_MM_dd") }
         $SuggestedJump = $LastJump; $SuggestedPeople = $LastPeople; $SuggestedDesc = $LastDesc; $SuggestedClip = ""
 
         if ($null -ne $LastJumpTime) {
@@ -322,9 +326,8 @@ try {
         if ($null -eq $Data) { break }
         if ($Data.Status -eq "SKIP") { Log-Info "Skipped."; continue }
 
-        $GlobalDate = $Data.Date; $LastJump = $Data.Jump; $LastPeople = $Data.People; $LastDesc = $Data.Desc; $LastJumpTime = $CurrentMediaTime
+        $LastJump = $Data.Jump; $LastPeople = $Data.People; $LastDesc = $Data.Desc; $LastJumpTime = $CurrentMediaTime
         
-        # --- SAFE RENAME LOGIC ---
         $SanitizedName = Clean-FileName $Data.FinalName
         $NewPath = Join-Path $TargetFolder $SanitizedName
         
