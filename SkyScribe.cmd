@@ -25,7 +25,7 @@ try {
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYSCRIBE v34 (MEMORY LEAK PATCHED) STARTED ===" -ForegroundColor Yellow
+    Write-Host "`n=== SKYSCRIBE v37 (DEPTH LIMIT & FREQ DEFAULT) STARTED ===" -ForegroundColor Yellow
     Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -48,6 +48,7 @@ try {
         MaxParallelFfmpeg = 4
         RecursivePeopleSearch = 0
         RecursiveJumpSearch   = 0
+        RecursionDepth        = 1  # NEW DEFAULT
     }
 
     if (Test-Path $ConfigFile) {
@@ -73,7 +74,8 @@ try {
             "PreviewWidth=480",
             "MaxParallelFfmpeg=4",
             "RecursivePeopleSearch=0",
-            "RecursiveJumpSearch=0"
+            "RecursiveJumpSearch=0",
+            "RecursionDepth=1"
         )
         $Content | Set-Content $ConfigFile
     }
@@ -113,35 +115,25 @@ try {
     }
     if ($DateIdx -eq 0) { $DateIdx = 4 }; if ($DurIdx -eq 0) { $DurIdx = 27 }
 
-    # PATCH: MEMORY SAFE METADATA READER
     function Get-MediaDate {
         param($FilePath)
         $Dir = [System.IO.Path]::GetDirectoryName($FilePath)
         $Name = [System.IO.Path]::GetFileName($FilePath)
         
-        $Namespace = $null
-        $Item = $null
-        $Result = $null
-
+        $Namespace = $null; $Item = $null; $Result = $null
         try {
-            # Use global shell to get namespace (creates RCW)
             $Namespace = $Shell.NameSpace($Dir)
             if ($Namespace) {
-                # ParseName creates another RCW
                 $Item = $Namespace.ParseName($Name)
                 if ($Item) {
                     $Raw = $Namespace.GetDetailsOf($Item, $DateIdx) -replace '[^0-9/ :APM]', ''
                     if ($Raw -as [DateTime]) { $Result = [DateTime]$Raw }
                 }
             }
-        } catch {
-            # Fallback handled below
-        } finally {
-            # STRICT CLEANUP: Force release of COM objects to prevent leak
+        } catch {} finally {
             if ($null -ne $Item) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Item) | Out-Null }
             if ($null -ne $Namespace) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Namespace) | Out-Null }
         }
-
         if ($Result) { return $Result }
         return (Get-Item $FilePath).LastWriteTime
     }
@@ -198,7 +190,7 @@ try {
         param($Cfg, $Path, $ParentForm)
         $SetForm = New-Object System.Windows.Forms.Form
         $SetForm.Text = "Settings"
-        $SetForm.Size = New-Object System.Drawing.Size(500, 500)
+        $SetForm.Size = New-Object System.Drawing.Size(500, 560) # Increased height for new option
         $SetForm.StartPosition = "CenterParent"
         $SetForm.FormBorderStyle = "FixedDialog"
         $SetForm.MaximizeBox = $false
@@ -206,7 +198,6 @@ try {
         $SetForm.TopMost = $true
 
         $FontStd = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Regular)
-        
         $Layout = @{ Top = 20 }
         
         $AddNum = { param($Lbl, $Key, $Min, $Max) 
@@ -223,6 +214,10 @@ try {
 
         $cRecP = &$AddChk "Recursive People Search" "RecursivePeopleSearch"
         $cRecJ = &$AddChk "Recursive Jump Search" "RecursiveJumpSearch"
+        
+        # New Depth Control
+        $nDepth = &$AddNum "Max Recursion Depth (Layers)" "RecursionDepth" 0 20
+        
         $nSkip = &$AddNum "Skip Start (seconds)" "SkipSeconds" 0 300
         $nWind = &$AddNum "Window Duration (seconds)" "WindowSeconds" 10 600
         $nFrame= &$AddNum "Thumbnail Count" "FrameCount" 1 50
@@ -235,10 +230,10 @@ try {
         $SetForm.CancelButton = $BtnCancel
 
         $Result = $SetForm.ShowDialog($ParentForm)
-        
         if ($Result -eq "OK") {
             $Cfg["RecursivePeopleSearch"] = if ($cRecP.Checked) { 1 } else { 0 }
             $Cfg["RecursiveJumpSearch"]   = if ($cRecJ.Checked) { 1 } else { 0 }
+            $Cfg["RecursionDepth"]        = [int]$nDepth.Value
             $Cfg["SkipSeconds"]           = [int]$nSkip.Value
             $Cfg["WindowSeconds"]         = [int]$nWind.Value
             $Cfg["FrameCount"]            = [int]$nFrame.Value
@@ -249,10 +244,7 @@ try {
             foreach ($k in $Cfg.Keys) { $NewContent += "$k=$($Cfg[$k])" }
             $NewContent | Set-Content $Path -Force
         }
-        
-        # PATCH: EXPLICITLY DISPOSE SETTINGS FORM
         $SetForm.Dispose()
-        
         return ($Result -eq "OK")
     }
 
@@ -274,9 +266,7 @@ try {
         $SettingsItem = New-Object System.Windows.Forms.ToolStripMenuItem("Settings...")
         $ExitItem = New-Object System.Windows.Forms.ToolStripMenuItem("Exit")
         
-        # Abort Signal for Menu Exit
         $ExitItem.Add_Click({ $Form.DialogResult = [System.Windows.Forms.DialogResult]::Abort; $Form.Close() })
-
         $FileMenu.DropDownItems.Add($SettingsItem)
         $FileMenu.DropDownItems.Add("-")
         $FileMenu.DropDownItems.Add($ExitItem)
@@ -317,17 +307,31 @@ try {
         # Recent People
         &$AddLabel "RECENT PEOPLE (Double-Click):" 20 460
         $Form.Controls[$Form.Controls.Count-1].Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-        $PeopleList = New-Object System.Windows.Forms.ListBox; $PeopleList.Top = 45 + $YOffset; $PeopleList.Left = 460; $PeopleList.Width = 240; $PeopleList.Height = 350; $PeopleList.Font = $FontStd
+        
+        $SortDrop = New-Object System.Windows.Forms.ComboBox; $SortDrop.Top = 45 + $YOffset; $SortDrop.Left = 460; $SortDrop.Width = 150; $SortDrop.Font = $FontStd
+        $SortDrop.Items.Add("Sort: Frequency") # CHANGED ORDER
+        $SortDrop.Items.Add("Sort: A-Z")
+        $SortDrop.SelectedIndex = 0
+        $SortDrop.DropDownStyle = "DropDownList"
+        $SortDrop.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+        $Form.Controls.Add($SortDrop)
+
+        $PeopleList = New-Object System.Windows.Forms.ListBox; $PeopleList.Top = 75 + $YOffset; $PeopleList.Left = 460; $PeopleList.Width = 240; $PeopleList.Height = 350; $PeopleList.Font = $FontStd
         $PeopleList.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-        $NamesFound = New-Object System.Collections.Generic.HashSet[string];
+        $NameCounts = @{} 
         $Form.Controls.Add($PeopleList) 
         
         # --- PEOPLE REFRESH LOGIC ---
         $RefreshPeopleList = {
             $PeopleList.Items.Clear()
-            $NamesFound.Clear()
+            $NameCounts.Clear()
             $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
-            if ($Config.RecursivePeopleSearch -eq 1) { $SearchArgs["Recurse"] = $true }
+            
+            # --- NEW DEPTH LOGIC ---
+            if ($Config.RecursivePeopleSearch -eq 1) { 
+                $SearchArgs["Recurse"] = $true 
+                $SearchArgs["Depth"] = $Config.RecursionDepth # Limit depth
+            }
             
             Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" } | ForEach-Object { 
                 $clean = $_.BaseName
@@ -335,24 +339,34 @@ try {
                 $clean = $clean -replace "^#\d+\s+\d{4}_\d{2}_\d{2}", ""
                 $clean.Trim().Split(" ") | ForEach-Object { 
                     $n = $_.Trim()
-                    if ($n -and $n -notmatch "\d" -and $n -notmatch "-") { [void]$NamesFound.Add($n) } 
+                    if ($n -and $n -notmatch "\d" -and $n -notmatch "-") { 
+                        if (-not $NameCounts.ContainsKey($n)) { $NameCounts[$n] = 0 }
+                        $NameCounts[$n]++ 
+                    } 
                 } 
             }
-            foreach ($n in ($NamesFound | Sort-Object)) { [void]$PeopleList.Items.Add($n) }
+            
+            # --- SORTING (0 = Freq, 1 = A-Z) ---
+            $SortedNames = if ($SortDrop.SelectedIndex -eq 0) {
+                $NameCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -ExpandProperty Key
+            } else {
+                $NameCounts.Keys | Sort-Object
+            }
+            
+            foreach ($n in $SortedNames) { [void]$PeopleList.Items.Add($n) }
         }
         
         # Initial Load
         &$RefreshPeopleList
 
-        # --- SETTINGS MENU EVENT ---
+        $SortDrop.Add_SelectedIndexChanged({ &$RefreshPeopleList })
+
         $SettingsItem.Add_Click({ 
             if (Show-SettingsForm -Cfg $Config -Path $ConfigFile -ParentForm $Form) {
-                # Settings Saved -> Refresh People List
                 &$RefreshPeopleList
             }
         })
 
-        # People Click Event
         $PeopleList.Add_MouseDoubleClick({ if ($PeopleList.SelectedItem) { $current = $PeopleIn.Text.Trim(); if ($current -eq "") { $PeopleIn.Text = $PeopleList.SelectedItem } elseif ($current -notmatch "\b$([regex]::Escape($PeopleList.SelectedItem))\b") { $PeopleIn.Text = "$current $($PeopleList.SelectedItem)" } }})
 
         # Preview Label
@@ -468,6 +482,12 @@ try {
         if (-not $JumpFoundInSession -and $Config.RecursiveJumpSearch -eq 1) {
              Log-Info "Scanning folder for existing jumps (checking metadata)..."
              $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true; Recurse = $true }
+             
+             # --- DEPTH LIMIT ALSO APPLIED HERE ---
+             if ($Config.RecursiveJumpSearch -eq 1) { 
+                 $SearchArgs["Depth"] = $Config.RecursionDepth
+             }
+
              $Candidates = Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" }
              $BestMatch = $null; $SmallestGap = [double]::MaxValue
              
@@ -493,7 +513,10 @@ try {
         if ($JumpFoundInSession) {
             if ($SuggestedJump -match "^\d+$") {
                 $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
-                if ($Config.RecursiveJumpSearch -eq 1) { $SearchArgs["Recurse"] = $true }
+                if ($Config.RecursiveJumpSearch -eq 1) { 
+                    $SearchArgs["Recurse"] = $true 
+                    $SearchArgs["Depth"] = $Config.RecursionDepth 
+                }
                 
                 $TargetJump = $SuggestedJump.Trim()
                 $existing = Get-ChildItem @SearchArgs | Where-Object { $_.Name -like "#$TargetJump*" }
