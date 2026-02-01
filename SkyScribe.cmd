@@ -25,7 +25,7 @@ try {
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYSCRIBE v18 (MEMORY FIX + SMART WINDOW) STARTED ===" -ForegroundColor Yellow
+    Write-Host "`n=== SKYSCRIBE v25 (TRUE METADATA) STARTED ===" -ForegroundColor Yellow
     Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -46,6 +46,8 @@ try {
         MinFileSizeKB     = 100
         PreviewWidth      = 480
         MaxParallelFfmpeg = 4
+        RecursivePeopleSearch = 0
+        RecursiveJumpSearch   = 0
     }
 
     if (Test-Path $ConfigFile) {
@@ -69,7 +71,9 @@ try {
             "VideoExtensions=.mp4,.mov,.3gp,.m4v,.mkv,.avi",
             "MinFileSizeKB=100",
             "PreviewWidth=480",
-            "MaxParallelFfmpeg=4"
+            "MaxParallelFfmpeg=4",
+            "RecursivePeopleSearch=0",
+            "RecursiveJumpSearch=0"
         )
         $Content | Set-Content $ConfigFile
     }
@@ -100,6 +104,7 @@ try {
 
     # --- 5. METADATA ENGINE ---
     $Shell = New-Object -ComObject Shell.Application
+    # We initialize folderObj just for index discovery, but we will create new ones dynamically for recursion
     $FolderObj = $Shell.NameSpace($TargetFolder)
     $DateIdx = 0; $DurIdx = 0
     for ($i = 0; $i -lt 320; $i++) {
@@ -109,33 +114,43 @@ try {
     }
     if ($DateIdx -eq 0) { $DateIdx = 4 }; if ($DurIdx -eq 0) { $DurIdx = 27 }
 
+    # NEW HELPER: Get True Media Date from ANY path (recursive friendly)
+    function Get-MediaDate {
+        param($FilePath)
+        $Dir = [System.IO.Path]::GetDirectoryName($FilePath)
+        $Name = [System.IO.Path]::GetFileName($FilePath)
+        
+        # Performance: Only create new namespace if different from current global
+        $Namespace = $Shell.NameSpace($Dir)
+        $Item = $Namespace.ParseName($Name)
+        
+        $Raw = $Namespace.GetDetailsOf($Item, $DateIdx) -replace '[^0-9/ :APM]', ''
+        if ($Raw -as [DateTime]) { return [DateTime]$Raw }
+        
+        # Fallback to filesystem if metadata missing
+        return (Get-Item $FilePath).LastWriteTime
+    }
+
     # --- 6. PREFETCH ENGINE (SMART WINDOW LOGIC) ---
     $PreviewJobScript = {
         param($FFmpegPath, $InputFile, $DurationStr, $BaseTempPath, $UniqueId, $CfgSkip, $CfgWindow, $CfgFrames, $CfgWidth, $MaxParallel)
         
         if ($DurationStr -match "(\d+):(\d+):(\d+)") { $TotalSecs = ([int]$matches[1] * 3600) + ([int]$matches[2] * 60) + [int]$matches[3] } else { return $null }
         $OutDir = Join-Path $BaseTempPath $UniqueId
+        
         if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-        # --- LOGIC UPDATE STARTS HERE ---
         $StartTime = $CfgSkip
         $EndTime = $CfgSkip + $CfgWindow
 
         if ($TotalSecs -lt $CfgWindow) {
-            # Case 1: File is shorter than the desired window (e.g. 40s file, 60s window)
-            # Action: Show everything from 0 to End. Ignore Skip.
-            $StartTime = 0
-            $EndTime = $TotalSecs
+            $StartTime = 0; $EndTime = $TotalSecs
         } elseif ($TotalSecs -lt $CfgSkip) {
-            # Case 2: File is incredibly short (shorter than Skip)
-            $StartTime = 0
-            $EndTime = $TotalSecs
+            $StartTime = 0; $EndTime = $TotalSecs
         } elseif ($TotalSecs -lt $EndTime) {
-            # Case 3: File is long enough to Skip, but ends before full Window finishes
             $EndTime = $TotalSecs
         }
-        # --- LOGIC UPDATE ENDS HERE ---
 
         $TimeWindow = $EndTime - $StartTime; if ($TimeWindow -le 0) { $TimeWindow = 1 }
         $Interval = $TimeWindow / ($CfgFrames + 1)
@@ -220,7 +235,13 @@ try {
         $Form.Controls[$Form.Controls.Count-1].Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
         $PeopleList = New-Object System.Windows.Forms.ListBox; $PeopleList.Top = 45; $PeopleList.Left = 460; $PeopleList.Width = 240; $PeopleList.Height = 350; $PeopleList.Font = $FontStd
         $PeopleList.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-        $NamesFound = New-Object System.Collections.Generic.HashSet[string]; Get-ChildItem -Path $TargetFolder | Where-Object { $_.Name -match "^#\d+" } | ForEach-Object { $clean = $_.BaseName; if ($clean -match " -") { $clean = $clean.Substring(0, $clean.IndexOf(" -")) }; $clean = $clean -replace "^#\d+\s+\d{4}_\d{2}_\d{2}", ""; $clean.Trim().Split(" ") | ForEach-Object { $n = $_.Trim(); if ($n -and $n -notmatch "\d" -and $n -notmatch "-") { [void]$NamesFound.Add($n) } } }; foreach ($n in ($NamesFound | Sort-Object)) { [void]$PeopleList.Items.Add($n) }
+        $NamesFound = New-Object System.Collections.Generic.HashSet[string];
+        
+        $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
+        if ($Config.RecursivePeopleSearch -eq 1) { $SearchArgs["Recurse"] = $true }
+        
+        Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" } | ForEach-Object { $clean = $_.BaseName; if ($clean -match " -") { $clean = $clean.Substring(0, $clean.IndexOf(" -")) }; $clean = $clean -replace "^#\d+\s+\d{4}_\d{2}_\d{2}", ""; $clean.Trim().Split(" ") | ForEach-Object { $n = $_.Trim(); if ($n -and $n -notmatch "\d" -and $n -notmatch "-") { [void]$NamesFound.Add($n) } } };
+        foreach ($n in ($NamesFound | Sort-Object)) { [void]$PeopleList.Items.Add($n) }
         $Form.Controls.Add($PeopleList)
         $PeopleList.Add_MouseDoubleClick({ if ($PeopleList.SelectedItem) { $current = $PeopleIn.Text.Trim(); if ($current -eq "") { $PeopleIn.Text = $PeopleList.SelectedItem } elseif ($current -notmatch "\b$([regex]::Escape($PeopleList.SelectedItem))\b") { $PeopleIn.Text = "$current $($PeopleList.SelectedItem)" } }})
 
@@ -273,10 +294,7 @@ try {
     Log-Info "Sorting selected files by Media Created date..."
     $FilesWithDates = @()
     foreach ($File in $RawFiles) {
-        $ShellFile = $FolderObj.ParseName($File.Name)
-        $RawDate = $FolderObj.GetDetailsOf($ShellFile, $DateIdx) -replace '[^0-9/ :APM]', ''
-        $RealDate = if ($RawDate -as [DateTime]) { [DateTime]$RawDate } else { $File.LastWriteTime }
-        $FilesWithDates += [PSCustomObject]@{ FileObject = $File; SortDate = $RealDate }
+        $FilesWithDates += [PSCustomObject]@{ FileObject = $File; SortDate = (Get-MediaDate $File.FullName) }
     }
     $Files = $FilesWithDates | Sort-Object SortDate | Select-Object -ExpandProperty FileObject
     
@@ -290,17 +308,13 @@ try {
         Write-Host "----------------------------------------------------" -ForegroundColor Gray
         Log-Info "Processing File [$($i+1)/$($Files.Count)]: $($File.Name)"
         $Sw.Restart()
-        $ShellFile = $FolderObj.ParseName($File.Name)
-        $RawDate = $FolderObj.GetDetailsOf($ShellFile, $DateIdx) -replace '[^0-9/ :APM]', ''
-        $Duration = $FolderObj.GetDetailsOf($ShellFile, $DurIdx)
         
-        if ($RawDate -as [DateTime]) {
-             $CurrentMediaTime = [DateTime]$RawDate
-             $SuggestedDate = $CurrentMediaTime.ToString("yyyy_MM_dd")
-        } else {
-             $CurrentMediaTime = $File.LastWriteTime 
-             $SuggestedDate = ""
-        }
+        # Resolve Current Metadata
+        $CurrentMediaTime = Get-MediaDate $File.FullName
+        $SuggestedDate = $CurrentMediaTime.ToString("yyyy_MM_dd")
+        
+        $ShellFile = $FolderObj.ParseName($File.Name)
+        $Duration = $FolderObj.GetDetailsOf($ShellFile, $DurIdx)
 
         Log-Time "Metadata Read" $Sw
         $Images = @()
@@ -335,16 +349,80 @@ try {
 
         $SuggestedJump = $LastJump; $SuggestedPeople = $LastPeople; $SuggestedDesc = $LastDesc; $SuggestedClip = ""
 
+        # --- LOGIC SELECTION: Check session memory, or try filesystem proximity ---
+        $JumpFoundInSession = $false
         if ($null -ne $LastJumpTime) {
             if (($CurrentMediaTime - $LastJumpTime).TotalMinutes -le $Config.JumpGapMinutes) {
-                $existing = Get-ChildItem -Path $TargetFolder | Where-Object { $_.Name -like "#$SuggestedJump*" }
-                $max = 1
-                foreach ($ex in $existing) { if ($ex.Name -match "#$SuggestedJump-(\d+)") { $val = [int]$matches[1]; if ($val -gt $max) { $max = $val } } }
-                $SuggestedClip = ($max + 1).ToString()
-            } else {
-                if ($LastJump -match "^\d+$") { $SuggestedJump = [int]$LastJump + 1 }
-                $SuggestedPeople = ""; $SuggestedDesc = ""; $SuggestedClip = ""
+                $JumpFoundInSession = $true
             }
+        }
+
+        # If not found in session history, try finding a "Time Neighbor" on disk (PROXIMITY SEARCH)
+        if (-not $JumpFoundInSession -and $Config.RecursiveJumpSearch -eq 1) {
+             Log-Info "Scanning folder for existing jumps (checking metadata)..."
+             $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true; Recurse = $true }
+             $Candidates = Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" }
+             
+             $BestMatch = $null
+             $SmallestGap = [double]::MaxValue
+             
+             foreach ($c in $Candidates) {
+                # --- v25 UPDATE: USE TRUE METADATA FOR COMPARISON ---
+                $NeighborTime = Get-MediaDate $c.FullName
+                $Diff = [math]::Abs(($NeighborTime - $CurrentMediaTime).TotalMinutes)
+
+                if ($Diff -le $Config.JumpGapMinutes -and $Diff -lt $SmallestGap) {
+                    $SmallestGap = $Diff
+                    $BestMatch = $c
+                }
+             }
+
+             if ($BestMatch) {
+                if ($BestMatch.Name -match "^#(\d+)(?:-\d+)?\s+\d{4}_\d{2}_\d{2}\s+(.*?)(?:\s+-(.*))?\.") {
+                    $SuggestedJump = $matches[1]
+                    $SuggestedPeople = $matches[2].Trim()
+                    if ($matches.Count -gt 3) { $SuggestedDesc = $matches[3].Trim() }
+                    
+                    Log-Info "Found neighbor: $($BestMatch.Name) (Diff: $([math]::Round($SmallestGap,1)) min)"
+                    Log-Info "Inherited -> Jump: $SuggestedJump | People: $SuggestedPeople | Desc: $SuggestedDesc"
+                    $JumpFoundInSession = $true 
+                }
+             }
+        }
+
+        # --- CLIP CALCULATION LOGIC ---
+        if ($JumpFoundInSession) {
+            # Reuse Jump logic
+            if ($SuggestedJump -match "^\d+$") {
+                $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
+                if ($Config.RecursiveJumpSearch -eq 1) { $SearchArgs["Recurse"] = $true }
+                
+                $TargetJump = $SuggestedJump.Trim()
+                $existing = Get-ChildItem @SearchArgs | Where-Object { $_.Name -like "#$TargetJump*" }
+                $max = 0
+                $FoundAny = $false
+                
+                $EscapedJump = [regex]::Escape($TargetJump)
+                
+                foreach ($ex in $existing) {
+                    $FoundAny = $true
+                    if ($ex.Name -match "^#$EscapedJump-(\d+)") { 
+                        $val = [int]$matches[1]; if ($val -gt $max) { $max = $val } 
+                    }
+                }
+                
+                if ($max -gt 0) {
+                    $SuggestedClip = ($max + 1).ToString()
+                } elseif ($FoundAny) {
+                    $SuggestedClip = "2"
+                } else {
+                    $SuggestedClip = "1"
+                }
+            }
+        } else {
+            # New Jump Logic
+            if ($LastJump -match "^\d+$") { $SuggestedJump = [int]$LastJump + 1 }
+            $SuggestedPeople = ""; $SuggestedDesc = ""; $SuggestedClip = ""
         }
 
         Log-Info "Waiting for user input..."
