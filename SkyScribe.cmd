@@ -25,7 +25,7 @@ try {
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYSCRIBE v25 (TRUE METADATA) STARTED ===" -ForegroundColor Yellow
+    Write-Host "`n=== SKYSCRIBE v34 (MEMORY LEAK PATCHED) STARTED ===" -ForegroundColor Yellow
     Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -104,7 +104,6 @@ try {
 
     # --- 5. METADATA ENGINE ---
     $Shell = New-Object -ComObject Shell.Application
-    # We initialize folderObj just for index discovery, but we will create new ones dynamically for recursion
     $FolderObj = $Shell.NameSpace($TargetFolder)
     $DateIdx = 0; $DurIdx = 0
     for ($i = 0; $i -lt 320; $i++) {
@@ -114,43 +113,52 @@ try {
     }
     if ($DateIdx -eq 0) { $DateIdx = 4 }; if ($DurIdx -eq 0) { $DurIdx = 27 }
 
-    # NEW HELPER: Get True Media Date from ANY path (recursive friendly)
+    # PATCH: MEMORY SAFE METADATA READER
     function Get-MediaDate {
         param($FilePath)
         $Dir = [System.IO.Path]::GetDirectoryName($FilePath)
         $Name = [System.IO.Path]::GetFileName($FilePath)
         
-        # Performance: Only create new namespace if different from current global
-        $Namespace = $Shell.NameSpace($Dir)
-        $Item = $Namespace.ParseName($Name)
-        
-        $Raw = $Namespace.GetDetailsOf($Item, $DateIdx) -replace '[^0-9/ :APM]', ''
-        if ($Raw -as [DateTime]) { return [DateTime]$Raw }
-        
-        # Fallback to filesystem if metadata missing
+        $Namespace = $null
+        $Item = $null
+        $Result = $null
+
+        try {
+            # Use global shell to get namespace (creates RCW)
+            $Namespace = $Shell.NameSpace($Dir)
+            if ($Namespace) {
+                # ParseName creates another RCW
+                $Item = $Namespace.ParseName($Name)
+                if ($Item) {
+                    $Raw = $Namespace.GetDetailsOf($Item, $DateIdx) -replace '[^0-9/ :APM]', ''
+                    if ($Raw -as [DateTime]) { $Result = [DateTime]$Raw }
+                }
+            }
+        } catch {
+            # Fallback handled below
+        } finally {
+            # STRICT CLEANUP: Force release of COM objects to prevent leak
+            if ($null -ne $Item) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Item) | Out-Null }
+            if ($null -ne $Namespace) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Namespace) | Out-Null }
+        }
+
+        if ($Result) { return $Result }
         return (Get-Item $FilePath).LastWriteTime
     }
 
-    # --- 6. PREFETCH ENGINE (SMART WINDOW LOGIC) ---
+    # --- 6. PREFETCH ENGINE ---
     $PreviewJobScript = {
         param($FFmpegPath, $InputFile, $DurationStr, $BaseTempPath, $UniqueId, $CfgSkip, $CfgWindow, $CfgFrames, $CfgWidth, $MaxParallel)
         
         if ($DurationStr -match "(\d+):(\d+):(\d+)") { $TotalSecs = ([int]$matches[1] * 3600) + ([int]$matches[2] * 60) + [int]$matches[3] } else { return $null }
         $OutDir = Join-Path $BaseTempPath $UniqueId
-        
         if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-        $StartTime = $CfgSkip
-        $EndTime = $CfgSkip + $CfgWindow
-
-        if ($TotalSecs -lt $CfgWindow) {
-            $StartTime = 0; $EndTime = $TotalSecs
-        } elseif ($TotalSecs -lt $CfgSkip) {
-            $StartTime = 0; $EndTime = $TotalSecs
-        } elseif ($TotalSecs -lt $EndTime) {
-            $EndTime = $TotalSecs
-        }
+        $StartTime = $CfgSkip; $EndTime = $CfgSkip + $CfgWindow
+        if ($TotalSecs -lt $CfgWindow) { $StartTime = 0; $EndTime = $TotalSecs } 
+        elseif ($TotalSecs -lt $CfgSkip) { $StartTime = 0; $EndTime = $TotalSecs } 
+        elseif ($TotalSecs -lt $EndTime) { $EndTime = $TotalSecs }
 
         $TimeWindow = $EndTime - $StartTime; if ($TimeWindow -le 0) { $TimeWindow = 1 }
         $Interval = $TimeWindow / ($CfgFrames + 1)
@@ -158,19 +166,14 @@ try {
         $RunningProcs = @()
         for ($i=1; $i -le $CfgFrames; $i++) {
             while (($RunningProcs | Where-Object { try { -not $_.HasExited } catch { $false } }).Count -ge $MaxParallel) { Start-Sleep -Milliseconds 50 }
-
-            $PadNum = $i.ToString("00")
-            $OutFile = Join-Path $OutDir "frame_$PadNum.jpg"
+            $PadNum = $i.ToString("00"); $OutFile = Join-Path $OutDir "frame_$PadNum.jpg"
             $Offset = [math]::Round($Interval * $i); $FinalTime = $StartTime + $Offset
             $Args = "-ss $FinalTime -i `"$InputFile`" -frames:v 1 -vf scale=${CfgWidth}:-1 -q:v 5 -y `"$OutFile`""
-            
             $p = Start-Process -FilePath $FFmpegPath -ArgumentList $Args -WindowStyle Hidden -PassThru
             $RunningProcs += $p
         }
-
         while (($RunningProcs | Where-Object { try { -not $_.HasExited } catch { $false } }).Count -gt 0) { Start-Sleep -Milliseconds 50 }
         foreach ($p in $RunningProcs) { try { $p.Dispose() } catch {} }
-        
         return $OutDir
     }
 
@@ -190,24 +193,105 @@ try {
         return $Loaded
     }
 
+    # --- SETTINGS FORM ---
+    function Show-SettingsForm {
+        param($Cfg, $Path, $ParentForm)
+        $SetForm = New-Object System.Windows.Forms.Form
+        $SetForm.Text = "Settings"
+        $SetForm.Size = New-Object System.Drawing.Size(500, 500)
+        $SetForm.StartPosition = "CenterParent"
+        $SetForm.FormBorderStyle = "FixedDialog"
+        $SetForm.MaximizeBox = $false
+        $SetForm.MinimizeBox = $false
+        $SetForm.TopMost = $true
+
+        $FontStd = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Regular)
+        
+        $Layout = @{ Top = 20 }
+        
+        $AddNum = { param($Lbl, $Key, $Min, $Max) 
+            $l = New-Object System.Windows.Forms.Label; $l.Text=$Lbl; $l.Top=$Layout.Top+3; $l.Left=30; $l.AutoSize=$true; $l.Font=$FontStd; $SetForm.Controls.Add($l)
+            $n = New-Object System.Windows.Forms.NumericUpDown; $n.Top=$Layout.Top; $n.Left=300; $n.Width=120; $n.Minimum=$Min; $n.Maximum=$Max; $n.Value=$Cfg[$Key]; $n.Font=$FontStd; $SetForm.Controls.Add($n)
+            $Layout.Top += 45
+            return $n
+        }
+        $AddChk = { param($Lbl, $Key)
+            $c = New-Object System.Windows.Forms.CheckBox; $c.Text=$Lbl; $c.Top=$Layout.Top; $c.Left=30; $c.Width=400; $c.Checked=($Cfg[$Key] -eq 1); $c.Font=$FontStd; $SetForm.Controls.Add($c)
+            $Layout.Top += 45
+            return $c
+        }
+
+        $cRecP = &$AddChk "Recursive People Search" "RecursivePeopleSearch"
+        $cRecJ = &$AddChk "Recursive Jump Search" "RecursiveJumpSearch"
+        $nSkip = &$AddNum "Skip Start (seconds)" "SkipSeconds" 0 300
+        $nWind = &$AddNum "Window Duration (seconds)" "WindowSeconds" 10 600
+        $nFrame= &$AddNum "Thumbnail Count" "FrameCount" 1 50
+        $nGap  = &$AddNum "Jump Gap (minutes)" "JumpGapMinutes" 1 120
+        $nPar  = &$AddNum "Parallel FFmpeg Threads" "MaxParallelFfmpeg" 1 16
+
+        $BtnSave = New-Object System.Windows.Forms.Button; $BtnSave.Text="Save"; $BtnSave.Top=$Layout.Top+20; $BtnSave.Left=120; $BtnSave.Width=100; $BtnSave.Height=35; $BtnSave.DialogResult="OK"; $SetForm.Controls.Add($BtnSave)
+        $BtnCancel = New-Object System.Windows.Forms.Button; $BtnCancel.Text="Cancel"; $BtnCancel.Top=$Layout.Top+20; $BtnCancel.Left=240; $BtnCancel.Width=100; $BtnCancel.Height=35; $BtnCancel.DialogResult="Cancel"; $SetForm.Controls.Add($BtnCancel)
+        $SetForm.AcceptButton = $BtnSave
+        $SetForm.CancelButton = $BtnCancel
+
+        $Result = $SetForm.ShowDialog($ParentForm)
+        
+        if ($Result -eq "OK") {
+            $Cfg["RecursivePeopleSearch"] = if ($cRecP.Checked) { 1 } else { 0 }
+            $Cfg["RecursiveJumpSearch"]   = if ($cRecJ.Checked) { 1 } else { 0 }
+            $Cfg["SkipSeconds"]           = [int]$nSkip.Value
+            $Cfg["WindowSeconds"]         = [int]$nWind.Value
+            $Cfg["FrameCount"]            = [int]$nFrame.Value
+            $Cfg["JumpGapMinutes"]        = [int]$nGap.Value
+            $Cfg["MaxParallelFfmpeg"]     = [int]$nPar.Value
+            
+            $NewContent = @("[SkyScribe Settings]")
+            foreach ($k in $Cfg.Keys) { $NewContent += "$k=$($Cfg[$k])" }
+            $NewContent | Set-Content $Path -Force
+        }
+        
+        # PATCH: EXPLICITLY DISPOSE SETTINGS FORM
+        $SetForm.Dispose()
+        
+        return ($Result -eq "OK")
+    }
+
     function Show-SkydiveForm {
         param($FileName, $FullName, $FileTime, $Duration, $SuggestedDate, $SuggestedJump, $SuggestedClip, $SuggestedPeople, $SuggestedDesc, $TargetFolder, $OriginalExt, $PreloadedImages, $Config)
         
         $Form = New-Object System.Windows.Forms.Form
         $Form.Text = "$AppName - $FileName"
-        $Form.Size = New-Object System.Drawing.Size(760, 900)
+        $Form.Size = New-Object System.Drawing.Size(760, 930) 
         $Form.StartPosition = "CenterScreen"
         $Form.Topmost = $true 
         $Form.FormBorderStyle = "Sizable"
         $Form.MaximizeBox = $true
         $Form.MinimumSize = New-Object System.Drawing.Size(760, 600)
 
+        # --- MENU STRIP ---
+        $MenuStrip = New-Object System.Windows.Forms.MenuStrip
+        $FileMenu = New-Object System.Windows.Forms.ToolStripMenuItem("File")
+        $SettingsItem = New-Object System.Windows.Forms.ToolStripMenuItem("Settings...")
+        $ExitItem = New-Object System.Windows.Forms.ToolStripMenuItem("Exit")
+        
+        # Abort Signal for Menu Exit
+        $ExitItem.Add_Click({ $Form.DialogResult = [System.Windows.Forms.DialogResult]::Abort; $Form.Close() })
+
+        $FileMenu.DropDownItems.Add($SettingsItem)
+        $FileMenu.DropDownItems.Add("-")
+        $FileMenu.DropDownItems.Add($ExitItem)
+        $MenuStrip.Items.Add($FileMenu)
+        $Form.MainMenuStrip = $MenuStrip
+        $Form.Controls.Add($MenuStrip)
+
         $FontStd  = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Regular)
         $FontBold = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
         $FontPrev = New-Object System.Drawing.Font("Consolas", 10, [System.Drawing.FontStyle]::Bold) 
 
-        $AddLabel = { param($txt, $top, $left=25) $l = New-Object System.Windows.Forms.Label; $l.Text = $txt; $l.Top = $top; $l.Left = $left; $l.AutoSize = $true; $l.Font = $FontBold; $Form.Controls.Add($l) }
-        $AddValue = { param($txt, $top, $left=130) $l = New-Object System.Windows.Forms.Label; $l.Text = $txt; $l.Top = $top; $l.Left = $left; $l.AutoSize = $true; $l.Font = $FontStd; $Form.Controls.Add($l) }
+        $YOffset = 30
+        
+        $AddLabel = { param($txt, $top, $left=25) $l = New-Object System.Windows.Forms.Label; $l.Text = $txt; $l.Top = $top + $YOffset; $l.Left = $left; $l.AutoSize = $true; $l.Font = $FontBold; $Form.Controls.Add($l) }
+        $AddValue = { param($txt, $top, $left=130) $l = New-Object System.Windows.Forms.Label; $l.Text = $txt; $l.Top = $top + $YOffset; $l.Left = $left; $l.AutoSize = $true; $l.Font = $FontStd; $Form.Controls.Add($l) }
 
         # --- CONTROLS ---
         &$AddLabel "LOCATION:" 15; $ShortLoc = if ($TargetFolder.Length -gt 60) { "..." + $TargetFolder.Substring($TargetFolder.Length - 60) } else { $TargetFolder }; &$AddValue $ShortLoc 15
@@ -215,50 +299,77 @@ try {
         &$AddLabel "TIMESTAMP:" 75; &$AddValue $FileTime 75
         &$AddLabel "LENGTH:" 105; $DurText = if ($Duration) { $Duration } else { "---" }; &$AddValue $DurText 105
 
-        &$AddLabel "Date (YYYY_MM_DD):" 150; $DateIn = New-Object System.Windows.Forms.TextBox; $DateIn.Top = 175; $DateIn.Left = 30; $DateIn.Width = 380; $DateIn.Text = $SuggestedDate; $DateIn.Font = $FontStd
+        &$AddLabel "Date (YYYY_MM_DD):" 150; $DateIn = New-Object System.Windows.Forms.TextBox; $DateIn.Top = 175 + $YOffset; $DateIn.Left = 30; $DateIn.Width = 380; $DateIn.Text = $SuggestedDate; $DateIn.Font = $FontStd
         $DateIn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
         $Form.Controls.Add($DateIn)
 
-        &$AddLabel "Jump Number:" 220; $JumpIn = New-Object System.Windows.Forms.TextBox; $JumpIn.Top = 245; $JumpIn.Left = 30; $JumpIn.Width = 180; $JumpIn.Text = $SuggestedJump; $JumpIn.Font = $FontStd; $Form.Controls.Add($JumpIn)
-        &$AddLabel "Clip Number:" 220 230; $ClipIn = New-Object System.Windows.Forms.TextBox; $ClipIn.Top = 245; $ClipIn.Left = 230; $ClipIn.Width = 180; $ClipIn.Text = $SuggestedClip; $ClipIn.Font = $FontStd; $Form.Controls.Add($ClipIn)
+        &$AddLabel "Jump Number:" 220; $JumpIn = New-Object System.Windows.Forms.TextBox; $JumpIn.Top = 245 + $YOffset; $JumpIn.Left = 30; $JumpIn.Width = 180; $JumpIn.Text = $SuggestedJump; $JumpIn.Font = $FontStd; $Form.Controls.Add($JumpIn)
+        &$AddLabel "Clip Number:" 220 230; $ClipIn = New-Object System.Windows.Forms.TextBox; $ClipIn.Top = 245 + $YOffset; $ClipIn.Left = 230; $ClipIn.Width = 180; $ClipIn.Text = $SuggestedClip; $ClipIn.Font = $FontStd; $Form.Controls.Add($ClipIn)
 
-        &$AddLabel "People:" 280; $PeopleIn = New-Object System.Windows.Forms.TextBox; $PeopleIn.Top = 305; $PeopleIn.Left = 30; $PeopleIn.Width = 380; $PeopleIn.Text = $SuggestedPeople; $PeopleIn.Font = $FontStd
+        &$AddLabel "People:" 280; $PeopleIn = New-Object System.Windows.Forms.TextBox; $PeopleIn.Top = 305 + $YOffset; $PeopleIn.Left = 30; $PeopleIn.Width = 380; $PeopleIn.Text = $SuggestedPeople; $PeopleIn.Font = $FontStd
         $PeopleIn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
         $Form.Controls.Add($PeopleIn)
 
-        &$AddLabel "Description:" 340; $DescIn = New-Object System.Windows.Forms.TextBox; $DescIn.Top = 365; $DescIn.Left = 30; $DescIn.Width = 380; $DescIn.Text = $SuggestedDesc; $DescIn.Font = $FontStd
+        &$AddLabel "Description:" 340; $DescIn = New-Object System.Windows.Forms.TextBox; $DescIn.Top = 365 + $YOffset; $DescIn.Left = 30; $DescIn.Width = 380; $DescIn.Text = $SuggestedDesc; $DescIn.Font = $FontStd
         $DescIn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
         $Form.Controls.Add($DescIn)
 
         # Recent People
         &$AddLabel "RECENT PEOPLE (Double-Click):" 20 460
         $Form.Controls[$Form.Controls.Count-1].Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-        $PeopleList = New-Object System.Windows.Forms.ListBox; $PeopleList.Top = 45; $PeopleList.Left = 460; $PeopleList.Width = 240; $PeopleList.Height = 350; $PeopleList.Font = $FontStd
+        $PeopleList = New-Object System.Windows.Forms.ListBox; $PeopleList.Top = 45 + $YOffset; $PeopleList.Left = 460; $PeopleList.Width = 240; $PeopleList.Height = 350; $PeopleList.Font = $FontStd
         $PeopleList.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
         $NamesFound = New-Object System.Collections.Generic.HashSet[string];
+        $Form.Controls.Add($PeopleList) 
         
-        $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
-        if ($Config.RecursivePeopleSearch -eq 1) { $SearchArgs["Recurse"] = $true }
+        # --- PEOPLE REFRESH LOGIC ---
+        $RefreshPeopleList = {
+            $PeopleList.Items.Clear()
+            $NamesFound.Clear()
+            $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
+            if ($Config.RecursivePeopleSearch -eq 1) { $SearchArgs["Recurse"] = $true }
+            
+            Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" } | ForEach-Object { 
+                $clean = $_.BaseName
+                if ($clean -match " -") { $clean = $clean.Substring(0, $clean.IndexOf(" -")) }
+                $clean = $clean -replace "^#\d+\s+\d{4}_\d{2}_\d{2}", ""
+                $clean.Trim().Split(" ") | ForEach-Object { 
+                    $n = $_.Trim()
+                    if ($n -and $n -notmatch "\d" -and $n -notmatch "-") { [void]$NamesFound.Add($n) } 
+                } 
+            }
+            foreach ($n in ($NamesFound | Sort-Object)) { [void]$PeopleList.Items.Add($n) }
+        }
         
-        Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" } | ForEach-Object { $clean = $_.BaseName; if ($clean -match " -") { $clean = $clean.Substring(0, $clean.IndexOf(" -")) }; $clean = $clean -replace "^#\d+\s+\d{4}_\d{2}_\d{2}", ""; $clean.Trim().Split(" ") | ForEach-Object { $n = $_.Trim(); if ($n -and $n -notmatch "\d" -and $n -notmatch "-") { [void]$NamesFound.Add($n) } } };
-        foreach ($n in ($NamesFound | Sort-Object)) { [void]$PeopleList.Items.Add($n) }
-        $Form.Controls.Add($PeopleList)
+        # Initial Load
+        &$RefreshPeopleList
+
+        # --- SETTINGS MENU EVENT ---
+        $SettingsItem.Add_Click({ 
+            if (Show-SettingsForm -Cfg $Config -Path $ConfigFile -ParentForm $Form) {
+                # Settings Saved -> Refresh People List
+                &$RefreshPeopleList
+            }
+        })
+
+        # People Click Event
         $PeopleList.Add_MouseDoubleClick({ if ($PeopleList.SelectedItem) { $current = $PeopleIn.Text.Trim(); if ($current -eq "") { $PeopleIn.Text = $PeopleList.SelectedItem } elseif ($current -notmatch "\b$([regex]::Escape($PeopleList.SelectedItem))\b") { $PeopleIn.Text = "$current $($PeopleList.SelectedItem)" } }})
 
         # Preview Label
-        &$AddLabel "LIVE PREVIEW:" 430; $PreviewBox = New-Object System.Windows.Forms.Label; $PreviewBox.Top = 455; $PreviewBox.Left = 30; $PreviewBox.Width = 670; $PreviewBox.Height = 50; $PreviewBox.ForeColor = "Blue"; $PreviewBox.Font = $FontPrev; $PreviewBox.BorderStyle = "FixedSingle"; $PreviewBox.TextAlign = "MiddleLeft"; $PreviewBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right; $Form.Controls.Add($PreviewBox)
+        &$AddLabel "LIVE PREVIEW:" 430; $PreviewBox = New-Object System.Windows.Forms.Label; $PreviewBox.Top = 455 + $YOffset; $PreviewBox.Left = 30; $PreviewBox.Width = 670; $PreviewBox.Height = 50; $PreviewBox.ForeColor = "Blue"; $PreviewBox.Font = $FontPrev; $PreviewBox.BorderStyle = "FixedSingle"; $PreviewBox.TextAlign = "MiddleLeft"; $PreviewBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right; $Form.Controls.Add($PreviewBox)
         $UpdateBlock = { $j = $JumpIn.Text.Trim(); $c = $ClipIn.Text.Trim(); $suffix = if ($c) { "-$c" } else { "" }; $JumpStr = if ($j) { "#$j$suffix" } else { "" }; $DescStr = if ($DescIn.Text.Trim()) { "-$($DescIn.Text.Trim())" } else { "" }; $raw = "$JumpStr $($DateIn.Text) $($PeopleIn.Text) $DescStr$OriginalExt"; $PreviewBox.Text = ($raw -replace '\s+', ' ' -replace '\s+\.', '.').Trim() }
         $DateIn.Add_TextChanged($UpdateBlock); $JumpIn.Add_TextChanged($UpdateBlock); $ClipIn.Add_TextChanged($UpdateBlock); $PeopleIn.Add_TextChanged($UpdateBlock); $DescIn.Add_TextChanged($UpdateBlock); &$UpdateBlock
 
         # --- DOCKED FOOTER ---
         $Footer = New-Object System.Windows.Forms.Panel; $Footer.Dock = [System.Windows.Forms.DockStyle]::Bottom; $Footer.Height = 80; $Form.Controls.Add($Footer)
+        
         $SkipBtn = New-Object System.Windows.Forms.Button; $SkipBtn.Text = "SKIP"; $SkipBtn.Top = 15; $SkipBtn.Left = 30; $SkipBtn.Width = 120; $SkipBtn.Height = 50; $SkipBtn.DialogResult = [System.Windows.Forms.DialogResult]::Ignore; $Footer.Controls.Add($SkipBtn)
         $OkBtn = New-Object System.Windows.Forms.Button; $OkBtn.Text = "RENAME"; $OkBtn.Top = 15; $OkBtn.Left = 160; $OkBtn.Width = 540; $OkBtn.Height = 50; $OkBtn.BackColor = "LightGreen"; $OkBtn.Font = $FontBold; $OkBtn.DialogResult = [System.Windows.Forms.DialogResult]::OK; $Form.AcceptButton = $OkBtn; $OkBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right; $Footer.Controls.Add($OkBtn)
 
         # --- SMART FILMSTRIP ---
         $StartLbl = $Config.SkipSeconds; $EndLbl = $Config.SkipSeconds + $Config.WindowSeconds
         &$AddLabel "VIDEO FRAMES (${StartLbl}s to ${EndLbl}s):" 530
-        $FlowPanel = New-Object System.Windows.Forms.FlowLayoutPanel; $FlowPanel.Top = 560; $FlowPanel.Left = 30; $FlowPanel.Width = 670; $FlowPanel.Height = $Form.ClientSize.Height - $Footer.Height - 560 - 10
+        $FlowPanel = New-Object System.Windows.Forms.FlowLayoutPanel; $FlowPanel.Top = 560 + $YOffset; $FlowPanel.Left = 30; $FlowPanel.Width = 670; $FlowPanel.Height = $Form.ClientSize.Height - $Footer.Height - ($FlowPanel.Top) - 10
         $FlowPanel.WrapContents = $false; $FlowPanel.AutoScroll = $true; $FlowPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right; $Form.Controls.Add($FlowPanel)
 
         $ResizeImages = {
@@ -282,7 +393,7 @@ try {
         $Result = $Form.ShowDialog()
         $OutData = if ($Result -eq "OK") { @{ Status="RENAME"; FinalName=$PreviewBox.Text; Date=$DateIn.Text; Jump=$JumpIn.Text; Clip=$ClipIn.Text; People=$PeopleIn.Text; Desc=$DescIn.Text } }
                    elseif ($Result -eq "Ignore") { @{ Status="SKIP" } }
-                   else { $null }
+                   else { @{ Status="ABORT" } }
 
         $Form.Dispose()
         return $OutData
@@ -309,10 +420,8 @@ try {
         Log-Info "Processing File [$($i+1)/$($Files.Count)]: $($File.Name)"
         $Sw.Restart()
         
-        # Resolve Current Metadata
         $CurrentMediaTime = Get-MediaDate $File.FullName
         $SuggestedDate = $CurrentMediaTime.ToString("yyyy_MM_dd")
-        
         $ShellFile = $FolderObj.ParseName($File.Name)
         $Duration = $FolderObj.GetDetailsOf($ShellFile, $DurIdx)
 
@@ -349,7 +458,6 @@ try {
 
         $SuggestedJump = $LastJump; $SuggestedPeople = $LastPeople; $SuggestedDesc = $LastDesc; $SuggestedClip = ""
 
-        # --- LOGIC SELECTION: Check session memory, or try filesystem proximity ---
         $JumpFoundInSession = $false
         if ($null -ne $LastJumpTime) {
             if (($CurrentMediaTime - $LastJumpTime).TotalMinutes -le $Config.JumpGapMinutes) {
@@ -357,32 +465,24 @@ try {
             }
         }
 
-        # If not found in session history, try finding a "Time Neighbor" on disk (PROXIMITY SEARCH)
         if (-not $JumpFoundInSession -and $Config.RecursiveJumpSearch -eq 1) {
              Log-Info "Scanning folder for existing jumps (checking metadata)..."
              $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true; Recurse = $true }
              $Candidates = Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" }
-             
-             $BestMatch = $null
-             $SmallestGap = [double]::MaxValue
+             $BestMatch = $null; $SmallestGap = [double]::MaxValue
              
              foreach ($c in $Candidates) {
-                # --- v25 UPDATE: USE TRUE METADATA FOR COMPARISON ---
                 $NeighborTime = Get-MediaDate $c.FullName
                 $Diff = [math]::Abs(($NeighborTime - $CurrentMediaTime).TotalMinutes)
-
                 if ($Diff -le $Config.JumpGapMinutes -and $Diff -lt $SmallestGap) {
-                    $SmallestGap = $Diff
-                    $BestMatch = $c
+                    $SmallestGap = $Diff; $BestMatch = $c
                 }
              }
 
              if ($BestMatch) {
                 if ($BestMatch.Name -match "^#(\d+)(?:-\d+)?\s+\d{4}_\d{2}_\d{2}\s+(.*?)(?:\s+-(.*))?\.") {
-                    $SuggestedJump = $matches[1]
-                    $SuggestedPeople = $matches[2].Trim()
+                    $SuggestedJump = $matches[1]; $SuggestedPeople = $matches[2].Trim()
                     if ($matches.Count -gt 3) { $SuggestedDesc = $matches[3].Trim() }
-                    
                     Log-Info "Found neighbor: $($BestMatch.Name) (Diff: $([math]::Round($SmallestGap,1)) min)"
                     Log-Info "Inherited -> Jump: $SuggestedJump | People: $SuggestedPeople | Desc: $SuggestedDesc"
                     $JumpFoundInSession = $true 
@@ -390,18 +490,14 @@ try {
              }
         }
 
-        # --- CLIP CALCULATION LOGIC ---
         if ($JumpFoundInSession) {
-            # Reuse Jump logic
             if ($SuggestedJump -match "^\d+$") {
                 $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
                 if ($Config.RecursiveJumpSearch -eq 1) { $SearchArgs["Recurse"] = $true }
                 
                 $TargetJump = $SuggestedJump.Trim()
                 $existing = Get-ChildItem @SearchArgs | Where-Object { $_.Name -like "#$TargetJump*" }
-                $max = 0
-                $FoundAny = $false
-                
+                $max = 0; $FoundAny = $false
                 $EscapedJump = [regex]::Escape($TargetJump)
                 
                 foreach ($ex in $existing) {
@@ -411,16 +507,11 @@ try {
                     }
                 }
                 
-                if ($max -gt 0) {
-                    $SuggestedClip = ($max + 1).ToString()
-                } elseif ($FoundAny) {
-                    $SuggestedClip = "2"
-                } else {
-                    $SuggestedClip = "1"
-                }
+                if ($max -gt 0) { $SuggestedClip = ($max + 1).ToString() } 
+                elseif ($FoundAny) { $SuggestedClip = "2" } 
+                else { $SuggestedClip = "1" }
             }
         } else {
-            # New Jump Logic
             if ($LastJump -match "^\d+$") { $SuggestedJump = [int]$LastJump + 1 }
             $SuggestedPeople = ""; $SuggestedDesc = ""; $SuggestedClip = ""
         }
@@ -431,12 +522,18 @@ try {
 
         if ($Images) { foreach ($img in $Images) { $img.Dispose() } }
         $Images = $null
-        
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
+        [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
 
-        if ($null -eq $Data) { break }
-        if ($Data.Status -eq "SKIP") { Log-Info "Skipped."; continue }
+        if ($null -eq $Data) { Log-Info "Skipped (Null Data)."; continue }
+        
+        # --- EXIT LOGIC ---
+        if ($Data.Status -eq "ABORT") {
+             Log-Info "Exit requested by user. Goodbye!"
+             break
+        }
+        if ($Data.Status -eq "SKIP") { 
+            Log-Info "Skipped."; continue 
+        }
 
         $LastJump = $Data.Jump; $LastPeople = $Data.People; $LastDesc = $Data.Desc; $LastJumpTime = $CurrentMediaTime
         
