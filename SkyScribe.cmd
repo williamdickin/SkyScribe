@@ -25,7 +25,7 @@ try {
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYSCRIBE v37 (DEPTH LIMIT & FREQ DEFAULT) STARTED ===" -ForegroundColor Yellow
+    Write-Host "`n=== SKYSCRIBE v38 (FFPROBE EDITION) STARTED ===" -ForegroundColor Yellow
     Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -48,7 +48,7 @@ try {
         MaxParallelFfmpeg = 4
         RecursivePeopleSearch = 0
         RecursiveJumpSearch   = 0
-        RecursionDepth        = 1  # NEW DEFAULT
+        RecursionDepth        = 1
     }
 
     if (Test-Path $ConfigFile) {
@@ -95,54 +95,74 @@ try {
         Log-Info "Selected $($RawFiles.Count) files."
     } else { exit }
 
-    # --- 4. CHECK FFMPEG ---
+    # --- 4. CHECK FFMPEG & FFPROBE ---
     $FFmpegPath = Join-Path $TargetFolder "ffmpeg.exe"
     if (-not (Test-Path $FFmpegPath)) { $FFmpegPath = Join-Path $ScriptRoot "ffmpeg.exe" }
-    $FFmpegAvailable = Test-Path $FFmpegPath
-    if (-not $FFmpegAvailable) { 
-        if (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) { $FFmpegPath = (Get-Command "ffmpeg").Source; $FFmpegAvailable = $true } 
-        else { Write-Host "[ERROR] FFmpeg not found!" -ForegroundColor Red }
+    
+    # Check system path if not found locally
+    if (-not (Test-Path $FFmpegPath)) { 
+        if (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) { $FFmpegPath = (Get-Command "ffmpeg").Source } 
+        else { Write-Host "[ERROR] FFmpeg not found!" -ForegroundColor Red; pause; exit }
     }
 
-    # --- 5. METADATA ENGINE ---
-    $Shell = New-Object -ComObject Shell.Application
-    $FolderObj = $Shell.NameSpace($TargetFolder)
-    $DateIdx = 0; $DurIdx = 0
-    for ($i = 0; $i -lt 320; $i++) {
-        $name = $FolderObj.GetDetailsOf($null, $i)
-        if ($name -match "^Media created$|^Date taken$") { $DateIdx = $i }
-        if ($name -eq "Length") { $DurIdx = $i }
+    # Determine ffprobe path
+    $FFprobePath = $FFmpegPath.Replace("ffmpeg.exe", "ffprobe.exe")
+    if (-not (Test-Path $FFprobePath)) {
+        if (Get-Command "ffprobe" -ErrorAction SilentlyContinue) { $FFprobePath = (Get-Command "ffprobe").Source }
+        else { Write-Host "[WARN] FFprobe not found. Metadata reading will be limited." -ForegroundColor Yellow }
     }
-    if ($DateIdx -eq 0) { $DateIdx = 4 }; if ($DurIdx -eq 0) { $DurIdx = 27 }
 
-    function Get-MediaDate {
-        param($FilePath)
-        $Dir = [System.IO.Path]::GetDirectoryName($FilePath)
-        $Name = [System.IO.Path]::GetFileName($FilePath)
+    # --- 5. METADATA ENGINE (FFPROBE EDITION) ---
+    function Get-MediaMetadata {
+        param($FilePath, $ProbePath)
         
-        $Namespace = $null; $Item = $null; $Result = $null
-        try {
-            $Namespace = $Shell.NameSpace($Dir)
-            if ($Namespace) {
-                $Item = $Namespace.ParseName($Name)
-                if ($Item) {
-                    $Raw = $Namespace.GetDetailsOf($Item, $DateIdx) -replace '[^0-9/ :APM]', ''
-                    if ($Raw -as [DateTime]) { $Result = [DateTime]$Raw }
-                }
-            }
-        } catch {} finally {
-            if ($null -ne $Item) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Item) | Out-Null }
-            if ($null -ne $Namespace) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Namespace) | Out-Null }
+        # Default to filesystem values
+        $Item = Get-Item $FilePath
+        $Result = [PSCustomObject]@{
+            Date = $Item.LastWriteTime
+            Duration = "" 
         }
-        if ($Result) { return $Result }
-        return (Get-Item $FilePath).LastWriteTime
+
+        if ($ProbePath -and (Test-Path $ProbePath)) {
+            try {
+                # Get JSON data from ffprobe
+                # -v quiet: no junk output
+                # -print_format json: easy parsing
+                # -show_entries: only get what we need
+                $json = & $ProbePath -v quiet -print_format json -show_entries format=duration:format_tags=creation_time -i $FilePath | Out-String | ConvertFrom-Json
+                
+                # 1. Parse Duration (Seconds -> HH:mm:ss)
+                if ($json.format.duration) {
+                    $ts = [TimeSpan]::FromSeconds([double]$json.format.duration)
+                    $Result.Duration = $ts.ToString("hh\:mm\:ss")
+                }
+
+                # 2. Parse Date (creation_time is usually UTC)
+                if ($json.format.tags.creation_time) {
+                    $Result.Date = [DateTime]$json.format.tags.creation_time
+                }
+            } catch {
+                # If ffprobe fails/crashes, we silently keep the file-system defaults
+            }
+        }
+        return $Result
     }
 
     # --- 6. PREFETCH ENGINE ---
     $PreviewJobScript = {
         param($FFmpegPath, $InputFile, $DurationStr, $BaseTempPath, $UniqueId, $CfgSkip, $CfgWindow, $CfgFrames, $CfgWidth, $MaxParallel)
         
-        if ($DurationStr -match "(\d+):(\d+):(\d+)") { $TotalSecs = ([int]$matches[1] * 3600) + ([int]$matches[2] * 60) + [int]$matches[3] } else { return $null }
+        # Parse Duration string (HH:mm:ss) back to seconds for the logic
+        $TotalSecs = 0
+        if ($DurationStr -match "(\d+):(\d+):(\d+)") { 
+            $TotalSecs = ([int]$matches[1] * 3600) + ([int]$matches[2] * 60) + [int]$matches[3] 
+        } elseif ($DurationStr -match "^\d+(\.\d+)?$") {
+            $TotalSecs = [int][double]$DurationStr
+        } else {
+             # Fallback if duration missing: assume 1 hour to allow extraction attempt
+             $TotalSecs = 3600 
+        }
+
         $OutDir = Join-Path $BaseTempPath $UniqueId
         if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
@@ -190,7 +210,7 @@ try {
         param($Cfg, $Path, $ParentForm)
         $SetForm = New-Object System.Windows.Forms.Form
         $SetForm.Text = "Settings"
-        $SetForm.Size = New-Object System.Drawing.Size(500, 560) # Increased height for new option
+        $SetForm.Size = New-Object System.Drawing.Size(500, 560)
         $SetForm.StartPosition = "CenterParent"
         $SetForm.FormBorderStyle = "FixedDialog"
         $SetForm.MaximizeBox = $false
@@ -214,10 +234,7 @@ try {
 
         $cRecP = &$AddChk "Recursive People Search" "RecursivePeopleSearch"
         $cRecJ = &$AddChk "Recursive Jump Search" "RecursiveJumpSearch"
-        
-        # New Depth Control
         $nDepth = &$AddNum "Max Recursion Depth (Layers)" "RecursionDepth" 0 20
-        
         $nSkip = &$AddNum "Skip Start (seconds)" "SkipSeconds" 0 300
         $nWind = &$AddNum "Window Duration (seconds)" "WindowSeconds" 10 600
         $nFrame= &$AddNum "Thumbnail Count" "FrameCount" 1 50
@@ -309,7 +326,7 @@ try {
         $Form.Controls[$Form.Controls.Count-1].Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
         
         $SortDrop = New-Object System.Windows.Forms.ComboBox; $SortDrop.Top = 45 + $YOffset; $SortDrop.Left = 460; $SortDrop.Width = 150; $SortDrop.Font = $FontStd
-        $SortDrop.Items.Add("Sort: Frequency") # CHANGED ORDER
+        $SortDrop.Items.Add("Sort: Frequency")
         $SortDrop.Items.Add("Sort: A-Z")
         $SortDrop.SelectedIndex = 0
         $SortDrop.DropDownStyle = "DropDownList"
@@ -327,10 +344,9 @@ try {
             $NameCounts.Clear()
             $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
             
-            # --- NEW DEPTH LOGIC ---
             if ($Config.RecursivePeopleSearch -eq 1) { 
                 $SearchArgs["Recurse"] = $true 
-                $SearchArgs["Depth"] = $Config.RecursionDepth # Limit depth
+                $SearchArgs["Depth"] = $Config.RecursionDepth
             }
             
             Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" } | ForEach-Object { 
@@ -346,7 +362,7 @@ try {
                 } 
             }
             
-            # --- SORTING (0 = Freq, 1 = A-Z) ---
+            # --- SORTING ---
             $SortedNames = if ($SortDrop.SelectedIndex -eq 0) {
                 $NameCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -ExpandProperty Key
             } else {
@@ -406,8 +422,8 @@ try {
 
         $Result = $Form.ShowDialog()
         $OutData = if ($Result -eq "OK") { @{ Status="RENAME"; FinalName=$PreviewBox.Text; Date=$DateIn.Text; Jump=$JumpIn.Text; Clip=$ClipIn.Text; People=$PeopleIn.Text; Desc=$DescIn.Text } }
-                   elseif ($Result -eq "Ignore") { @{ Status="SKIP" } }
-                   else { @{ Status="ABORT" } }
+                    elseif ($Result -eq "Ignore") { @{ Status="SKIP" } }
+                    else { @{ Status="ABORT" } }
 
         $Form.Dispose()
         return $OutData
@@ -416,33 +432,45 @@ try {
     # --- 7. PROCESS LOOP ---
     $Sw = [System.Diagnostics.Stopwatch]::StartNew()
     
-    Log-Info "Sorting selected files by Media Created date..."
+    Log-Info "Analyzing file metadata with ffprobe..."
+    
+    # Pre-scan files to get robust Dates and Duration for sorting/logic
     $FilesWithDates = @()
     foreach ($File in $RawFiles) {
-        $FilesWithDates += [PSCustomObject]@{ FileObject = $File; SortDate = (Get-MediaDate $File.FullName) }
+        $Meta = Get-MediaMetadata -FilePath $File.FullName -ProbePath $FFprobePath
+        $FilesWithDates += [PSCustomObject]@{ 
+            FileObject = $File
+            SortDate   = $Meta.Date
+            Duration   = $Meta.Duration 
+        }
     }
-    $Files = $FilesWithDates | Sort-Object SortDate | Select-Object -ExpandProperty FileObject
+    
+    # Sort by the actual creation date
+    $SortedQueue = $FilesWithDates | Sort-Object SortDate
     
     $LastJump = ""; $LastJumpTime = $null; $LastPeople = ""; $LastDesc = ""
     $NextJob = $null; $BaseTempPath = Join-Path $env:TEMP "SkydivePreviews"
+    
     if (Test-Path $BaseTempPath) { Remove-Item $BaseTempPath -Recurse -Force -ErrorAction SilentlyContinue }
     New-Item -ItemType Directory -Path $BaseTempPath -Force | Out-Null
 
-    for ($i = 0; $i -lt $Files.Count; $i++) {
-        $File = $Files[$i]
+    for ($i = 0; $i -lt $SortedQueue.Count; $i++) {
+        $QueueItem = $SortedQueue[$i]
+        $File = $QueueItem.FileObject
+        
         Write-Host "----------------------------------------------------" -ForegroundColor Gray
-        Log-Info "Processing File [$($i+1)/$($Files.Count)]: $($File.Name)"
+        Log-Info "Processing File [$($i+1)/$($SortedQueue.Count)]: $($File.Name)"
         $Sw.Restart()
         
-        $CurrentMediaTime = Get-MediaDate $File.FullName
+        # Use robust metadata from the pre-scan
+        $CurrentMediaTime = $QueueItem.SortDate
+        $Duration = $QueueItem.Duration
         $SuggestedDate = $CurrentMediaTime.ToString("yyyy_MM_dd")
-        $ShellFile = $FolderObj.ParseName($File.Name)
-        $Duration = $FolderObj.GetDetailsOf($ShellFile, $DurIdx)
-
+        
         Log-Time "Metadata Read" $Sw
         $Images = @()
 
-        if ($FFmpegAvailable) {
+        if ($FFmpegPath) {
             if ($i -eq 0) {
                 Write-Host "      [SYNC] Generating initial thumbnails..." -ForegroundColor Yellow
                 $Job = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $File.FullName, $Duration, $BaseTempPath, "0", $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
@@ -461,17 +489,17 @@ try {
             }
         }
 
-        if (($i + 1) -lt $Files.Count -and $FFmpegAvailable) {
-            $NextFile = $Files[$i+1]
-            $NextShell = $FolderObj.ParseName($NextFile.Name)
-            $NextDur = $FolderObj.GetDetailsOf($NextShell, $DurIdx)
+        # Async Prefetch for next file
+        if (($i + 1) -lt $SortedQueue.Count -and $FFmpegPath) {
+            $NextItem = $SortedQueue[$i+1]
             $NextId = ($i + 1).ToString()
-            $NextJob = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $NextFile.FullName, $NextDur, $BaseTempPath, $NextId, $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
+            $NextJob = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $NextItem.FileObject.FullName, $NextItem.Duration, $BaseTempPath, $NextId, $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
             Write-Host "      [ASYNC] Prefetch started for next file." -ForegroundColor DarkGray
         } else { $NextJob = $null }
 
         $SuggestedJump = $LastJump; $SuggestedPeople = $LastPeople; $SuggestedDesc = $LastDesc; $SuggestedClip = ""
 
+        # Logic: Is this the same jump as the last file we just processed?
         $JumpFoundInSession = $false
         if ($null -ne $LastJumpTime) {
             if (($CurrentMediaTime - $LastJumpTime).TotalMinutes -le $Config.JumpGapMinutes) {
@@ -479,20 +507,21 @@ try {
             }
         }
 
+        # Logic: Search neighbors for gaps if not found in session
         if (-not $JumpFoundInSession -and $Config.RecursiveJumpSearch -eq 1) {
-             Log-Info "Scanning folder for existing jumps (checking metadata)..."
+             Log-Info "Scanning folder for existing jumps..."
              $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true; Recurse = $true }
              
-             # --- DEPTH LIMIT ALSO APPLIED HERE ---
              if ($Config.RecursiveJumpSearch -eq 1) { 
                  $SearchArgs["Depth"] = $Config.RecursionDepth
              }
 
+             # Note: For neighbor search, we use FS date for speed (checking 100s of files)
              $Candidates = Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" }
              $BestMatch = $null; $SmallestGap = [double]::MaxValue
              
              foreach ($c in $Candidates) {
-                $NeighborTime = Get-MediaDate $c.FullName
+                $NeighborTime = $c.LastWriteTime
                 $Diff = [math]::Abs(($NeighborTime - $CurrentMediaTime).TotalMinutes)
                 if ($Diff -le $Config.JumpGapMinutes -and $Diff -lt $SmallestGap) {
                     $SmallestGap = $Diff; $BestMatch = $c
@@ -587,7 +616,5 @@ try {
     Write-Host "Error Details: $($_.ScriptStackTrace)" -ForegroundColor Yellow
     pause
 } finally {
-    if ($null -ne $Shell) {
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Shell) | Out-Null
-    }
+    # No COM objects to release anymore!
 }
