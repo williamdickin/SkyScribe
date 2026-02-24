@@ -25,8 +25,8 @@ try {
         return $Name -replace '[\\/:*?"<>|]', '-'
     }
 
-    Write-Host "`n=== SKYSCRIBE v38 (FFPROBE EDITION) STARTED ===" -ForegroundColor Yellow
-    Write-Host "Waiting for folder selection...`n" -ForegroundColor DarkGray
+    Write-Host "`n=== SKYSCRIBE v3 (HUB EDITION) STARTED ===" -ForegroundColor Yellow
+    Write-Host "Waiting for user action in the main window...`n" -ForegroundColor DarkGray
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -81,50 +81,11 @@ try {
         )
         $Content | Set-Content $ConfigFile
     }
-    $VideoExtArray = $Config.VideoExtensions -split "," | ForEach-Object { $_.Trim().ToLower() }
 
-    # --- 3. FILE SELECTION ---
-    $OpenDlg = New-Object System.Windows.Forms.OpenFileDialog
-    $OpenDlg.Title = "Select videos to process (Hold Ctrl/Shift to select multiple)"
-    $OpenDlg.Multiselect = $true
-    
-    if ($Config.DefaultFolder -and (Test-Path $Config.DefaultFolder)) {
-        $OpenDlg.InitialDirectory = $Config.DefaultFolder
-    } else {
-        $OpenDlg.InitialDirectory = $ScriptRoot
-    }
-    
-    $FilterExts = $Config.VideoExtensions -replace ",", ";" -replace "\.", "*."
-    $OpenDlg.Filter = "Video Files ($FilterExts)|$FilterExts|All Files (*.*)|*.*"
-
-    if ($OpenDlg.ShowDialog() -eq "OK") {
-        $RawFiles = $OpenDlg.FileNames | Get-Item
-        $TargetFolder = $RawFiles[0].DirectoryName
-        Log-Info "Selected $($RawFiles.Count) files."
-    } else { exit }
-
-    # --- 4. CHECK FFMPEG & FFPROBE ---
-    $FFmpegPath = Join-Path $TargetFolder "ffmpeg.exe"
-    if (-not (Test-Path $FFmpegPath)) { $FFmpegPath = Join-Path $ScriptRoot "ffmpeg.exe" }
-    
-    # Check system path if not found locally
-    if (-not (Test-Path $FFmpegPath)) { 
-        if (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) { $FFmpegPath = (Get-Command "ffmpeg").Source } 
-        else { Write-Host "[ERROR] FFmpeg not found!" -ForegroundColor Red; pause; exit }
-    }
-
-    # Determine ffprobe path
-    $FFprobePath = $FFmpegPath.Replace("ffmpeg.exe", "ffprobe.exe")
-    if (-not (Test-Path $FFprobePath)) {
-        if (Get-Command "ffprobe" -ErrorAction SilentlyContinue) { $FFprobePath = (Get-Command "ffprobe").Source }
-        else { Write-Host "[WARN] FFprobe not found. Metadata reading will be limited." -ForegroundColor Yellow }
-    }
-
-    # --- 5. METADATA ENGINE (FFPROBE EDITION) ---
+    # --- 3. METADATA ENGINE (FFPROBE EDITION) ---
     function Get-MediaMetadata {
         param($FilePath, $ProbePath)
         
-        # Default to filesystem values
         $Item = Get-Item $FilePath
         $Result = [PSCustomObject]@{
             Date = $Item.LastWriteTime
@@ -133,41 +94,31 @@ try {
 
         if ($ProbePath -and (Test-Path $ProbePath)) {
             try {
-                # Get JSON data from ffprobe
-                # -v quiet: no junk output
-                # -print_format json: easy parsing
-                # -show_entries: only get what we need
                 $json = & $ProbePath -v quiet -print_format json -show_entries format=duration:format_tags=creation_time -i $FilePath | Out-String | ConvertFrom-Json
                 
-                # 1. Parse Duration (Seconds -> HH:mm:ss)
                 if ($json.format.duration) {
                     $ts = [TimeSpan]::FromSeconds([double]$json.format.duration)
                     $Result.Duration = $ts.ToString("hh\:mm\:ss")
                 }
 
-                # 2. Parse Date (creation_time is usually UTC)
                 if ($json.format.tags.creation_time) {
                     $Result.Date = [DateTime]$json.format.tags.creation_time
                 }
-            } catch {
-                # If ffprobe fails/crashes, we silently keep the file-system defaults
-            }
+            } catch {}
         }
         return $Result
     }
 
-    # --- 6. PREFETCH ENGINE ---
+    # --- 4. PREFETCH ENGINE ---
     $PreviewJobScript = {
         param($FFmpegPath, $InputFile, $DurationStr, $BaseTempPath, $UniqueId, $CfgSkip, $CfgWindow, $CfgFrames, $CfgWidth, $MaxParallel)
         
-        # Parse Duration string (HH:mm:ss) back to seconds for the logic
         $TotalSecs = 0
         if ($DurationStr -match "(\d+):(\d+):(\d+)") { 
             $TotalSecs = ([int]$matches[1] * 3600) + ([int]$matches[2] * 60) + [int]$matches[3] 
         } elseif ($DurationStr -match "^\d+(\.\d+)?$") {
             $TotalSecs = [int][double]$DurationStr
         } else {
-             # Fallback if duration missing: assume 1 hour to allow extraction attempt
              $TotalSecs = 3600 
         }
 
@@ -213,7 +164,7 @@ try {
         return $Loaded
     }
 
-    # --- SETTINGS FORM ---
+    # --- 5. SETTINGS FORM ---
     function Show-SettingsForm {
         param($Cfg, $Path, $ParentForm)
         $SetForm = New-Object System.Windows.Forms.Form
@@ -241,24 +192,20 @@ try {
             return $c
         }
 
-	# Helper to add a textbox alongside a folder browse button
         $AddFolderBrowser = { param($Lbl, $Key)
             $l = New-Object System.Windows.Forms.Label; $l.Text=$Lbl; $l.Top=$Layout.Top+3; $l.Left=30; $l.AutoSize=$true; $l.Font=$FontStd; $SetForm.Controls.Add($l)
             $t = New-Object System.Windows.Forms.TextBox; $t.Top=$Layout.Top; $t.Left=250; $t.Width=140; $t.Text=$Cfg[$Key]; $t.Font=$FontStd; $SetForm.Controls.Add($t)
             
             $b = New-Object System.Windows.Forms.Button; $b.Text="..."; $b.Top=$Layout.Top-1; $b.Left=395; $b.Width=30; $b.Height=26; $SetForm.Controls.Add($b)
-            
-            # Store the textbox in the button's Tag property to survive scope changes
             $b.Tag = $t 
             
             $b.Add_Click({
-                $txtBox = $this.Tag # Retrieve the textbox
+                $txtBox = $this.Tag 
                 $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
                 if ($txtBox.Text -and (Test-Path $txtBox.Text)) { $fbd.SelectedPath = $txtBox.Text }
                 if ($fbd.ShowDialog() -eq "OK") { $txtBox.Text = $fbd.SelectedPath }
                 $fbd.Dispose()
             })
-            
             $Layout.Top += 45
             return $t
         }
@@ -271,7 +218,6 @@ try {
         $nFrame = &$AddNum "Thumbnail Count" "FrameCount" 1 50
         $nGap   = &$AddNum "Jump Gap (minutes)" "JumpGapMinutes" 1 120
         $nPar   = &$AddNum "Parallel FFmpeg Threads" "MaxParallelFfmpeg" 1 16
-        
         $nPrevW = &$AddNum "Preview Width (px)" "PreviewWidth" 100 1920
         $tDefF  = &$AddFolderBrowser "Default Folder" "DefaultFolder"
 
@@ -301,6 +247,7 @@ try {
         return ($Result -eq "OK")
     }
 
+    # --- 6. MAIN RE-NAMING FORM ---
     function Show-SkydiveForm {
         param($FileName, $FullName, $FileTime, $Duration, $SuggestedDate, $SuggestedJump, $SuggestedClip, $SuggestedPeople, $SuggestedDesc, $TargetFolder, $OriginalExt, $PreloadedImages, $Config)
         
@@ -317,7 +264,7 @@ try {
         $MenuStrip = New-Object System.Windows.Forms.MenuStrip
         $FileMenu = New-Object System.Windows.Forms.ToolStripMenuItem("File")
         $SettingsItem = New-Object System.Windows.Forms.ToolStripMenuItem("Settings...")
-        $ExitItem = New-Object System.Windows.Forms.ToolStripMenuItem("Exit")
+        $ExitItem = New-Object System.Windows.Forms.ToolStripMenuItem("Exit Batch")
         
         $ExitItem.Add_Click({ $Form.DialogResult = [System.Windows.Forms.DialogResult]::Abort; $Form.Close() })
         $FileMenu.DropDownItems.Add($SettingsItem)
@@ -374,18 +321,14 @@ try {
         $NameCounts = @{} 
         $Form.Controls.Add($PeopleList) 
         
-        # --- PEOPLE REFRESH LOGIC ---
         $RefreshPeopleList = {
             $PeopleList.Items.Clear()
             $NameCounts.Clear()
-           
             $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
-            
             if ($Config.RecursivePeopleSearch -eq 1) { 
                 $SearchArgs["Recurse"] = $true 
                 $SearchArgs["Depth"] = $Config.RecursionDepth
             }
-            
             Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" } | ForEach-Object { 
                 $clean = $_.BaseName
                 if ($clean -match " -") { $clean = $clean.Substring(0, $clean.IndexOf(" -")) }
@@ -398,42 +341,32 @@ try {
                     } 
                 } 
             }
-            
-            # --- SORTING ---
             $SortedNames = if ($SortDrop.SelectedIndex -eq 0) {
                 $NameCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -ExpandProperty Key
             } else {
                 $NameCounts.Keys | Sort-Object
             }
-            
             foreach ($n in $SortedNames) { [void]$PeopleList.Items.Add($n) }
         }
         
-        # Initial Load
         &$RefreshPeopleList
-
         $SortDrop.Add_SelectedIndexChanged({ &$RefreshPeopleList })
 
         $SettingsItem.Add_Click({ 
-            if (Show-SettingsForm -Cfg $Config -Path $ConfigFile -ParentForm $Form) {
-                &$RefreshPeopleList
-            }
+            if (Show-SettingsForm -Cfg $Config -Path $ConfigFile -ParentForm $Form) { &$RefreshPeopleList }
         })
 
         $PeopleList.Add_MouseDoubleClick({ if ($PeopleList.SelectedItem) { $current = $PeopleIn.Text.Trim(); if ($current -eq "") { $PeopleIn.Text = $PeopleList.SelectedItem } elseif ($current -notmatch "\b$([regex]::Escape($PeopleList.SelectedItem))\b") { $PeopleIn.Text = "$current $($PeopleList.SelectedItem)" } }})
 
-        # Preview Label
         &$AddLabel "LIVE PREVIEW:" 430; $PreviewBox = New-Object System.Windows.Forms.Label; $PreviewBox.Top = 455 + $YOffset; $PreviewBox.Left = 30; $PreviewBox.Width = 670; $PreviewBox.Height = 50; $PreviewBox.ForeColor = "Blue"; $PreviewBox.Font = $FontPrev; $PreviewBox.BorderStyle = "FixedSingle"; $PreviewBox.TextAlign = "MiddleLeft"; $PreviewBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right; $Form.Controls.Add($PreviewBox)
         $UpdateBlock = { $j = $JumpIn.Text.Trim(); $c = $ClipIn.Text.Trim(); $suffix = if ($c) { "-$c" } else { "" }; $JumpStr = if ($j) { "#$j$suffix" } else { "" }; $DescStr = if ($DescIn.Text.Trim()) { "-$($DescIn.Text.Trim())" } else { "" }; $raw = "$JumpStr $($DateIn.Text) $($PeopleIn.Text) $DescStr$OriginalExt"; $PreviewBox.Text = ($raw -replace '\s+', ' ' -replace '\s+\.', '.').Trim() }
         $DateIn.Add_TextChanged($UpdateBlock); $JumpIn.Add_TextChanged($UpdateBlock); $ClipIn.Add_TextChanged($UpdateBlock); $PeopleIn.Add_TextChanged($UpdateBlock); $DescIn.Add_TextChanged($UpdateBlock); &$UpdateBlock
 
-        # --- DOCKED FOOTER ---
         $Footer = New-Object System.Windows.Forms.Panel; $Footer.Dock = [System.Windows.Forms.DockStyle]::Bottom; $Footer.Height = 80; $Form.Controls.Add($Footer)
         
         $SkipBtn = New-Object System.Windows.Forms.Button; $SkipBtn.Text = "SKIP"; $SkipBtn.Top = 15; $SkipBtn.Left = 30; $SkipBtn.Width = 120; $SkipBtn.Height = 50; $SkipBtn.DialogResult = [System.Windows.Forms.DialogResult]::Ignore; $Footer.Controls.Add($SkipBtn)
         $OkBtn = New-Object System.Windows.Forms.Button; $OkBtn.Text = "RENAME"; $OkBtn.Top = 15; $OkBtn.Left = 160; $OkBtn.Width = 540; $OkBtn.Height = 50; $OkBtn.BackColor = "LightGreen"; $OkBtn.Font = $FontBold; $OkBtn.DialogResult = [System.Windows.Forms.DialogResult]::OK; $Form.AcceptButton = $OkBtn; $OkBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right; $Footer.Controls.Add($OkBtn)
 
-        # --- SMART FILMSTRIP ---
         $StartLbl = $Config.SkipSeconds; $EndLbl = $Config.SkipSeconds + $Config.WindowSeconds
         &$AddLabel "VIDEO FRAMES (${StartLbl}s to ${EndLbl}s):" 530
         $FlowPanel = New-Object System.Windows.Forms.FlowLayoutPanel; $FlowPanel.Top = 560 + $YOffset; $FlowPanel.Left = 30; $FlowPanel.Width = 670; $FlowPanel.Height = $Form.ClientSize.Height - $Footer.Height - ($FlowPanel.Top) - 10
@@ -466,192 +399,261 @@ try {
         return $OutData
     }
 
-    # --- 7. PROCESS LOOP ---
-    $Sw = [System.Diagnostics.Stopwatch]::StartNew()
-    
-    Log-Info "Analyzing file metadata with ffprobe..."
-    
-    # Pre-scan files to get robust Dates and Duration for sorting/logic
-    $FilesWithDates = @()
-    foreach ($File in $RawFiles) {
-        $Meta = Get-MediaMetadata -FilePath $File.FullName -ProbePath $FFprobePath
-        $FilesWithDates += [PSCustomObject]@{ 
-            FileObject = $File
-            SortDate   = $Meta.Date
-            Duration   = $Meta.Duration 
+    # --- 7. BATCH PROCESSING WRAPPER ---
+    function Start-SkyScribeBatch {
+        
+        # --- FILE SELECTION ---
+        $OpenDlg = New-Object System.Windows.Forms.OpenFileDialog
+        $OpenDlg.Title = "Select videos to process (Hold Ctrl/Shift to select multiple)"
+        $OpenDlg.Multiselect = $true
+        
+        if ($Config.DefaultFolder -and (Test-Path $Config.DefaultFolder)) {
+            $OpenDlg.InitialDirectory = $Config.DefaultFolder
+        } else {
+            $OpenDlg.InitialDirectory = $ScriptRoot
         }
-    }
-    
-    # Sort by the actual creation date
-    $SortedQueue = $FilesWithDates | Sort-Object SortDate
-    
-    $LastJump = ""; $LastJumpTime = $null; $LastPeople = ""; $LastDesc = ""
-    $NextJob = $null; $BaseTempPath = Join-Path $env:TEMP "SkydivePreviews"
-    
-    if (Test-Path $BaseTempPath) { Remove-Item $BaseTempPath -Recurse -Force -ErrorAction SilentlyContinue }
-    New-Item -ItemType Directory -Path $BaseTempPath -Force | Out-Null
+        
+        $FilterExts = $Config.VideoExtensions -replace ",", ";" -replace "\.", "*."
+        $OpenDlg.Filter = "Video Files ($FilterExts)|$FilterExts|All Files (*.*)|*.*"
 
-    for ($i = 0; $i -lt $SortedQueue.Count; $i++) {
-        $QueueItem = $SortedQueue[$i]
-        $File = $QueueItem.FileObject
-        
-        Write-Host "----------------------------------------------------" -ForegroundColor Gray
-        Log-Info "Processing File [$($i+1)/$($SortedQueue.Count)]: $($File.Name)"
-        $Sw.Restart()
-        
-        # Use robust metadata from the pre-scan
-        $CurrentMediaTime = $QueueItem.SortDate
-        $Duration = $QueueItem.Duration
-        $SuggestedDate = $CurrentMediaTime.ToString("yyyy_MM_dd")
-        
-        Log-Time "Metadata Read" $Sw
-        $Images = @()
+        if ($OpenDlg.ShowDialog() -eq "OK") {
+            $RawFiles = $OpenDlg.FileNames | Get-Item
+            $TargetFolder = $RawFiles[0].DirectoryName
+            Log-Info "Selected $($RawFiles.Count) files."
+        } else { 
+            return # User canceled, return to Hub
+        }
 
-        if ($FFmpegPath) {
-            if ($i -eq 0) {
-                Write-Host "       [SYNC] Generating initial thumbnails..." -ForegroundColor Yellow
-                $Job = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $File.FullName, $Duration, $BaseTempPath, "0", $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
-                $ResultDir = $Job | Receive-Job -Wait -AutoRemoveJob
-                Log-Time "Thumbnail Gen" $Sw
-                $Images = Load-ImagesFromFolder $ResultDir
-                Log-Time "Image Load" $Sw
-            } else {
-                if ($NextJob) {
-                    Write-Host "      [ASYNC] Retrieving background job..." -ForegroundColor Gray
-                    $ResultDir = $NextJob | Receive-Job -Wait -AutoRemoveJob
-                    Log-Time "Retrieve Job" $Sw
+        # --- CHECK FFMPEG & FFPROBE ---
+        $FFmpegPath = Join-Path $TargetFolder "ffmpeg.exe"
+        if (-not (Test-Path $FFmpegPath)) { $FFmpegPath = Join-Path $ScriptRoot "ffmpeg.exe" }
+        
+        if (-not (Test-Path $FFmpegPath)) { 
+            if (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) { $FFmpegPath = (Get-Command "ffmpeg").Source } 
+            else { 
+                [System.Windows.Forms.MessageBox]::Show("FFmpeg not found! Please ensure ffmpeg.exe is in the script folder.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                return 
+            }
+        }
+
+        $FFprobePath = $FFmpegPath.Replace("ffmpeg.exe", "ffprobe.exe")
+        if (-not (Test-Path $FFprobePath)) {
+            if (Get-Command "ffprobe" -ErrorAction SilentlyContinue) { $FFprobePath = (Get-Command "ffprobe").Source }
+            else { Log-Warn "FFprobe not found. Metadata reading will be limited." }
+        }
+
+        # --- PROCESS LOOP ---
+        $Sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Log-Info "Analyzing file metadata with ffprobe..."
+        
+        $FilesWithDates = @()
+        foreach ($File in $RawFiles) {
+            $Meta = Get-MediaMetadata -FilePath $File.FullName -ProbePath $FFprobePath
+            $FilesWithDates += [PSCustomObject]@{ FileObject = $File; SortDate = $Meta.Date; Duration = $Meta.Duration }
+        }
+        
+        $SortedQueue = $FilesWithDates | Sort-Object SortDate
+        $LastJump = ""; $LastJumpTime = $null; $LastPeople = ""; $LastDesc = ""
+        $NextJob = $null; $BaseTempPath = Join-Path $env:TEMP "SkydivePreviews"
+        
+        if (Test-Path $BaseTempPath) { Remove-Item $BaseTempPath -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $BaseTempPath -Force | Out-Null
+
+        for ($i = 0; $i -lt $SortedQueue.Count; $i++) {
+            $QueueItem = $SortedQueue[$i]
+            $File = $QueueItem.FileObject
+            
+            Write-Host "----------------------------------------------------" -ForegroundColor Gray
+            Log-Info "Processing File [$($i+1)/$($SortedQueue.Count)]: $($File.Name)"
+            $Sw.Restart()
+            
+            $CurrentMediaTime = $QueueItem.SortDate
+            $Duration = $QueueItem.Duration
+            $SuggestedDate = $CurrentMediaTime.ToString("yyyy_MM_dd")
+            
+            Log-Time "Metadata Read" $Sw
+            $Images = @()
+
+            if ($FFmpegPath) {
+                if ($i -eq 0) {
+                    Write-Host "      [SYNC] Generating initial thumbnails..." -ForegroundColor Yellow
+                    $Job = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $File.FullName, $Duration, $BaseTempPath, "0", $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
+                    $ResultDir = $Job | Receive-Job -Wait -AutoRemoveJob
+                    Log-Time "Thumbnail Gen" $Sw
                     $Images = Load-ImagesFromFolder $ResultDir
                     Log-Time "Image Load" $Sw
-                }
-            }
-        }
-
-        # Async Prefetch for next file
-        if (($i + 1) -lt $SortedQueue.Count -and $FFmpegPath) {
-            $NextItem = $SortedQueue[$i+1]
-            $NextId = ($i + 1).ToString()
-            $NextJob = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $NextItem.FileObject.FullName, $NextItem.Duration, $BaseTempPath, $NextId, $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
-            Write-Host "      [ASYNC] Prefetch started for next file." -ForegroundColor DarkGray
-        } else { $NextJob = $null }
-
-        $SuggestedJump = $LastJump; $SuggestedPeople = $LastPeople; $SuggestedDesc = $LastDesc; $SuggestedClip = ""
-
-        # Logic: Is this the same jump as the last file we just processed?
-        $JumpFoundInSession = $false
-        if ($null -ne $LastJumpTime) {
-            if (($CurrentMediaTime - $LastJumpTime).TotalMinutes -le $Config.JumpGapMinutes) {
-                $JumpFoundInSession = $true
-            }
-        }
-
-        # Logic: Search neighbors for gaps if not found in session
-        if (-not $JumpFoundInSession -and $Config.RecursiveJumpSearch -eq 1) {
-             Log-Info "Scanning folder for existing jumps..."
-             $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true; Recurse = $true }
-             
-             if ($Config.RecursiveJumpSearch -eq 1) { 
-                 $SearchArgs["Depth"] = $Config.RecursionDepth
-             }
-
-             # Note: For neighbor search, we use FS date for speed (checking 100s of files)
-             $Candidates = Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" }
-             $BestMatch = $null; $SmallestGap = [double]::MaxValue
-             
-             foreach ($c in $Candidates) {
-                $NeighborTime = $c.LastWriteTime
-                $Diff = [math]::Abs(($NeighborTime - $CurrentMediaTime).TotalMinutes)
-                if ($Diff -le $Config.JumpGapMinutes -and $Diff -lt $SmallestGap) {
-                    $SmallestGap = $Diff; $BestMatch = $c
-                }
-             }
-
-             if ($BestMatch) {
-                if ($BestMatch.Name -match "^#(\d+)(?:-\d+)?\s+\d{4}_\d{2}_\d{2}\s+(.*?)(?:\s+-(.*))?\.") {
-                    $SuggestedJump = $matches[1]; $SuggestedPeople = $matches[2].Trim()
-                    if ($matches.Count -gt 3) { $SuggestedDesc = $matches[3].Trim() }
-                    Log-Info "Found neighbor: $($BestMatch.Name) (Diff: $([math]::Round($SmallestGap,1)) min)"
-                    Log-Info "Inherited -> Jump: $SuggestedJump | People: $SuggestedPeople | Desc: $SuggestedDesc"
-                    $JumpFoundInSession = $true 
-                }
-             }
-        }
-
-        if ($JumpFoundInSession) {
-            if ($SuggestedJump -match "^\d+$") {
-                $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
-                if ($Config.RecursiveJumpSearch -eq 1) { 
-                    $SearchArgs["Recurse"] = $true 
-                    $SearchArgs["Depth"] = $Config.RecursionDepth 
-                }
-              
-                $TargetJump = $SuggestedJump.Trim()
-                $existing = Get-ChildItem @SearchArgs | Where-Object { $_.Name -like "#$TargetJump*" }
-                $max = 0; $FoundAny = $false
-                $EscapedJump = [regex]::Escape($TargetJump)
-                
-                foreach ($ex in $existing) {
-                    $FoundAny = $true
-                    if ($ex.Name -match "^#$EscapedJump-(\d+)") { 
-                        $val = [int]$matches[1]; if ($val -gt $max) { $max = $val } 
+                } else {
+                    if ($NextJob) {
+                        Write-Host "      [ASYNC] Retrieving background job..." -ForegroundColor Gray
+                        $ResultDir = $NextJob | Receive-Job -Wait -AutoRemoveJob
+                        Log-Time "Retrieve Job" $Sw
+                        $Images = Load-ImagesFromFolder $ResultDir
+                        Log-Time "Image Load" $Sw
                     }
                 }
-                
-                if ($max -gt 0) { $SuggestedClip = ($max + 1).ToString() } 
-                elseif ($FoundAny) { $SuggestedClip = "2" } 
-                else { $SuggestedClip = "1" }
             }
-        } else {
-            if ($LastJump -match "^\d+$") { $SuggestedJump = [int]$LastJump + 1 }
-            $SuggestedPeople = ""; $SuggestedDesc = ""; $SuggestedClip = ""
-        }
 
-        Log-Info "Waiting for user input..."
-        $Data = Show-SkydiveForm -FileName $File.Name -FullName $File.FullName -FileTime $CurrentMediaTime.ToString("MMM dd, yyyy @ HH:mm:ss") -Duration $Duration -SuggestedDate $SuggestedDate -SuggestedJump $SuggestedJump -SuggestedClip $SuggestedClip -SuggestedPeople $SuggestedPeople -SuggestedDesc $SuggestedDesc -TargetFolder $TargetFolder -OriginalExt $File.Extension -PreloadedImages $Images -Config $Config
-        Log-Time "User Action" $Sw
+            if (($i + 1) -lt $SortedQueue.Count -and $FFmpegPath) {
+                $NextItem = $SortedQueue[$i+1]
+                $NextId = ($i + 1).ToString()
+                $NextJob = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $NextItem.FileObject.FullName, $NextItem.Duration, $BaseTempPath, $NextId, $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
+                Write-Host "      [ASYNC] Prefetch started for next file." -ForegroundColor DarkGray
+            } else { $NextJob = $null }
 
-        if ($Images) { foreach ($img in $Images) { $img.Dispose() } }
-        $Images = $null
-        [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+            $SuggestedJump = $LastJump; $SuggestedPeople = $LastPeople; $SuggestedDesc = $LastDesc; $SuggestedClip = ""
 
-        if ($null -eq $Data) { Log-Info "Skipped (Null Data)."; continue }
-        
-        # --- EXIT LOGIC ---
-        if ($Data.Status -eq "ABORT") {
-             Log-Info "Exit requested by user. Goodbye!"
-             break
-        }
-        if ($Data.Status -eq "SKIP") { 
-            Log-Info "Skipped."; continue 
-        }
+            $JumpFoundInSession = $false
+            if ($null -ne $LastJumpTime) {
+                if (($CurrentMediaTime - $LastJumpTime).TotalMinutes -le $Config.JumpGapMinutes) {
+                    $JumpFoundInSession = $true
+                }
+            }
 
-        $LastJump = $Data.Jump; $LastPeople = $Data.People; $LastDesc = $Data.Desc; $LastJumpTime = $CurrentMediaTime
-        
-        $SanitizedName = Clean-FileName $Data.FinalName
-        $NewPath = Join-Path $TargetFolder $SanitizedName
-        
-        if (Test-Path $NewPath) {
-            Log-Warn "File exists! Appending ID to prevent overwrite."
-            $Salt = (Get-Random -Minimum 100 -Maximum 999).ToString()
-            $SanitizedName = $SanitizedName -replace "(\.[^.]+)$", "-$Salt`$1"
+            if (-not $JumpFoundInSession -and $Config.RecursiveJumpSearch -eq 1) {
+                 Log-Info "Scanning folder for existing jumps..."
+                 $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true; Recurse = $true }
+                 if ($Config.RecursiveJumpSearch -eq 1) { $SearchArgs["Depth"] = $Config.RecursionDepth }
+
+                 $Candidates = Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" }
+                 $BestMatch = $null; $SmallestGap = [double]::MaxValue
+                 
+                 foreach ($c in $Candidates) {
+                    $NeighborTime = $c.LastWriteTime
+                    $Diff = [math]::Abs(($NeighborTime - $CurrentMediaTime).TotalMinutes)
+                    if ($Diff -le $Config.JumpGapMinutes -and $Diff -lt $SmallestGap) {
+                        $SmallestGap = $Diff; $BestMatch = $c
+                    }
+                 }
+
+                 if ($BestMatch) {
+                    if ($BestMatch.Name -match "^#(\d+)(?:-\d+)?\s+\d{4}_\d{2}_\d{2}\s+(.*?)(?:\s+-(.*))?\.") {
+                        $SuggestedJump = $matches[1]; $SuggestedPeople = $matches[2].Trim()
+                        if ($matches.Count -gt 3) { $SuggestedDesc = $matches[3].Trim() }
+                        Log-Info "Found neighbor: $($BestMatch.Name) (Diff: $([math]::Round($SmallestGap,1)) min)"
+                        $JumpFoundInSession = $true 
+                    }
+                 }
+            }
+
+            if ($JumpFoundInSession) {
+                if ($SuggestedJump -match "^\d+$") {
+                    $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
+                    if ($Config.RecursiveJumpSearch -eq 1) { $SearchArgs["Recurse"] = $true; $SearchArgs["Depth"] = $Config.RecursionDepth }
+                  
+                    $TargetJump = $SuggestedJump.Trim()
+                    $existing = Get-ChildItem @SearchArgs | Where-Object { $_.Name -like "#$TargetJump*" }
+                    $max = 0; $FoundAny = $false
+                    $EscapedJump = [regex]::Escape($TargetJump)
+                    
+                    foreach ($ex in $existing) {
+                        $FoundAny = $true
+                        if ($ex.Name -match "^#$EscapedJump-(\d+)") { 
+                            $val = [int]$matches[1]; if ($val -gt $max) { $max = $val } 
+                        }
+                    }
+                    
+                    if ($max -gt 0) { $SuggestedClip = ($max + 1).ToString() } 
+                    elseif ($FoundAny) { $SuggestedClip = "2" } 
+                    else { $SuggestedClip = "1" }
+                }
+            } else {
+                if ($LastJump -match "^\d+$") { $SuggestedJump = [int]$LastJump + 1 }
+                $SuggestedPeople = ""; $SuggestedDesc = ""; $SuggestedClip = ""
+            }
+
+            Log-Info "Waiting for user input..."
+            $Data = Show-SkydiveForm -FileName $File.Name -FullName $File.FullName -FileTime $CurrentMediaTime.ToString("MMM dd, yyyy @ HH:mm:ss") -Duration $Duration -SuggestedDate $SuggestedDate -SuggestedJump $SuggestedJump -SuggestedClip $SuggestedClip -SuggestedPeople $SuggestedPeople -SuggestedDesc $SuggestedDesc -TargetFolder $TargetFolder -OriginalExt $File.Extension -PreloadedImages $Images -Config $Config
+            Log-Time "User Action" $Sw
+
+            if ($Images) { foreach ($img in $Images) { $img.Dispose() } }
+            $Images = $null
+            [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+
+            if ($null -eq $Data) { Log-Info "Skipped (Null Data)."; continue }
+            
+            if ($Data.Status -eq "ABORT") { Log-Info "Exited processing early. Returning to Hub."; break }
+            if ($Data.Status -eq "SKIP") { Log-Info "Skipped."; continue }
+
+            $LastJump = $Data.Jump; $LastPeople = $Data.People; $LastDesc = $Data.Desc; $LastJumpTime = $CurrentMediaTime
+            
+            $SanitizedName = Clean-FileName $Data.FinalName
             $NewPath = Join-Path $TargetFolder $SanitizedName
+            
+            if (Test-Path $NewPath) {
+                Log-Warn "File exists! Appending ID to prevent overwrite."
+                $Salt = (Get-Random -Minimum 100 -Maximum 999).ToString()
+                $SanitizedName = $SanitizedName -replace "(\.[^.]+)$", "-$Salt`$1"
+                $NewPath = Join-Path $TargetFolder $SanitizedName
+            }
+            
+            try {
+                Rename-Item -Path $File.FullName -NewName $SanitizedName -ErrorAction Stop
+                Log-Info "Renamed to: $SanitizedName"
+            } catch {
+                Log-Warn "Rename failed: $($_.Exception.Message)"
+            }
         }
-        
-        try {
-            Rename-Item -Path $File.FullName -NewName $SanitizedName -ErrorAction Stop
-            Log-Info "Renamed to: $SanitizedName"
-         } catch {
-            Log-Warn "Rename failed: $($_.Exception.Message)"
-        }
+
+        Remove-Item $BaseTempPath -Recurse -Force -ErrorAction SilentlyContinue
+        Log-Info "Batch complete! Returning to Hub..."
     }
 
-    Remove-Item $BaseTempPath -Recurse -Force -ErrorAction SilentlyContinue
-    Log-Info "All done. Closing..."
-    Start-Sleep -Seconds 1
+    # --- 8. MAIN HUB WINDOW ---
+    $HubForm = New-Object System.Windows.Forms.Form
+    $HubForm.Text = "$AppName - Hub"
+    $HubForm.Size = New-Object System.Drawing.Size(500, 400)
+    $HubForm.StartPosition = "CenterScreen"
+    $HubForm.FormBorderStyle = "FixedDialog"
+    $HubForm.MaximizeBox = $false
+    $HubForm.BackColor = [System.Drawing.Color]::White
+
+    # Menu Strip
+    $HubMenu = New-Object System.Windows.Forms.MenuStrip
+    $FileMenu = New-Object System.Windows.Forms.ToolStripMenuItem("File")
+    $OpenItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open Videos...")
+    $SettingsItem = New-Object System.Windows.Forms.ToolStripMenuItem("Settings...")
+    $ExitItem = New-Object System.Windows.Forms.ToolStripMenuItem("Exit")
+
+    $ExitItem.Add_Click({ $HubForm.Close() })
+    $SettingsItem.Add_Click({ Show-SettingsForm -Cfg $Config -Path $ConfigFile -ParentForm $HubForm | Out-Null })
+    $OpenItem.Add_Click({ 
+        $HubForm.Hide()         
+        Start-SkyScribeBatch    
+        $HubForm.Show()         
+    })
+
+    $FileMenu.DropDownItems.Add($OpenItem)
+    $FileMenu.DropDownItems.Add($SettingsItem)
+    $FileMenu.DropDownItems.Add("-")
+    $FileMenu.DropDownItems.Add($ExitItem)
+    $HubMenu.Items.Add($FileMenu)
+    $HubForm.MainMenuStrip = $HubMenu
+    $HubForm.Controls.Add($HubMenu)
+
+    # Logo Display
+    $LogoBox = New-Object System.Windows.Forms.PictureBox
+    $LogoBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $LogoBox.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+    
+    $LogoPath = Join-Path $ScriptRoot "SkyScribeLogo.jpg"
+    
+    if (Test-Path $LogoPath) {
+        $LogoBox.Image = [System.Drawing.Image]::FromFile($LogoPath)
+    } else {
+        $FallbackLabel = New-Object System.Windows.Forms.Label
+        $FallbackLabel.Text = "To display your logo, save the image as `n`n'SkyScribeLogo.jpg'`n`nin the same folder as this script."
+        $FallbackLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $FallbackLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $HubForm.Controls.Add($FallbackLabel)
+    }
+    $HubForm.Controls.Add($LogoBox)
+    $LogoBox.BringToFront()
+
+    # Launch the Hub!
+    [void]$HubForm.ShowDialog()
 
 } catch {
     Write-Host "CRITICAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "Error Details: $($_.ScriptStackTrace)" -ForegroundColor Yellow
     pause
-} finally {
-    # No COM objects to release anymore!
 }
