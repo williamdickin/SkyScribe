@@ -49,6 +49,7 @@ try {
         RecursivePeopleSearch = 0
         RecursiveJumpSearch   = 0
         RecursionDepth        = 1
+        DefaultFolder         = ""
     }
 
     if (Test-Path $ConfigFile) {
@@ -57,7 +58,7 @@ try {
                 $Key = $matches[1].Trim()
                 $Value = $matches[2].Trim()
                 if ($Config.ContainsKey($Key)) { 
-                    if ($Key -eq "VideoExtensions") { $Config[$Key] = $Value } 
+                    if ($Key -in @("VideoExtensions", "DefaultFolder")) { $Config[$Key] = $Value } 
                     elseif ($Value -match "^\d+$") { $Config[$Key] = [int]$Value }
                 }
             }
@@ -75,7 +76,8 @@ try {
             "MaxParallelFfmpeg=4",
             "RecursivePeopleSearch=0",
             "RecursiveJumpSearch=0",
-            "RecursionDepth=1"
+            "RecursionDepth=1",
+            "DefaultFolder="
         )
         $Content | Set-Content $ConfigFile
     }
@@ -85,7 +87,13 @@ try {
     $OpenDlg = New-Object System.Windows.Forms.OpenFileDialog
     $OpenDlg.Title = "Select videos to process (Hold Ctrl/Shift to select multiple)"
     $OpenDlg.Multiselect = $true
-    $OpenDlg.InitialDirectory = $ScriptRoot
+    
+    if ($Config.DefaultFolder -and (Test-Path $Config.DefaultFolder)) {
+        $OpenDlg.InitialDirectory = $Config.DefaultFolder
+    } else {
+        $OpenDlg.InitialDirectory = $ScriptRoot
+    }
+    
     $FilterExts = $Config.VideoExtensions -replace ",", ";" -replace "\.", "*."
     $OpenDlg.Filter = "Video Files ($FilterExts)|$FilterExts|All Files (*.*)|*.*"
 
@@ -210,7 +218,7 @@ try {
         param($Cfg, $Path, $ParentForm)
         $SetForm = New-Object System.Windows.Forms.Form
         $SetForm.Text = "Settings"
-        $SetForm.Size = New-Object System.Drawing.Size(500, 560)
+        $SetForm.Size = New-Object System.Drawing.Size(500, 650)
         $SetForm.StartPosition = "CenterParent"
         $SetForm.FormBorderStyle = "FixedDialog"
         $SetForm.MaximizeBox = $false
@@ -226,20 +234,46 @@ try {
             $Layout.Top += 45
             return $n
         }
+        
         $AddChk = { param($Lbl, $Key)
             $c = New-Object System.Windows.Forms.CheckBox; $c.Text=$Lbl; $c.Top=$Layout.Top; $c.Left=30; $c.Width=400; $c.Checked=($Cfg[$Key] -eq 1); $c.Font=$FontStd; $SetForm.Controls.Add($c)
             $Layout.Top += 45
             return $c
         }
 
-        $cRecP = &$AddChk "Recursive People Search" "RecursivePeopleSearch"
-        $cRecJ = &$AddChk "Recursive Jump Search" "RecursiveJumpSearch"
+	# Helper to add a textbox alongside a folder browse button
+        $AddFolderBrowser = { param($Lbl, $Key)
+            $l = New-Object System.Windows.Forms.Label; $l.Text=$Lbl; $l.Top=$Layout.Top+3; $l.Left=30; $l.AutoSize=$true; $l.Font=$FontStd; $SetForm.Controls.Add($l)
+            $t = New-Object System.Windows.Forms.TextBox; $t.Top=$Layout.Top; $t.Left=250; $t.Width=140; $t.Text=$Cfg[$Key]; $t.Font=$FontStd; $SetForm.Controls.Add($t)
+            
+            $b = New-Object System.Windows.Forms.Button; $b.Text="..."; $b.Top=$Layout.Top-1; $b.Left=395; $b.Width=30; $b.Height=26; $SetForm.Controls.Add($b)
+            
+            # Store the textbox in the button's Tag property to survive scope changes
+            $b.Tag = $t 
+            
+            $b.Add_Click({
+                $txtBox = $this.Tag # Retrieve the textbox
+                $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+                if ($txtBox.Text -and (Test-Path $txtBox.Text)) { $fbd.SelectedPath = $txtBox.Text }
+                if ($fbd.ShowDialog() -eq "OK") { $txtBox.Text = $fbd.SelectedPath }
+                $fbd.Dispose()
+            })
+            
+            $Layout.Top += 45
+            return $t
+        }
+
+        $cRecP  = &$AddChk "Recursive People Search" "RecursivePeopleSearch"
+        $cRecJ  = &$AddChk "Recursive Jump Search" "RecursiveJumpSearch"
         $nDepth = &$AddNum "Max Recursion Depth (Layers)" "RecursionDepth" 0 20
-        $nSkip = &$AddNum "Skip Start (seconds)" "SkipSeconds" 0 300
-        $nWind = &$AddNum "Window Duration (seconds)" "WindowSeconds" 10 600
-        $nFrame= &$AddNum "Thumbnail Count" "FrameCount" 1 50
-        $nGap  = &$AddNum "Jump Gap (minutes)" "JumpGapMinutes" 1 120
-        $nPar  = &$AddNum "Parallel FFmpeg Threads" "MaxParallelFfmpeg" 1 16
+        $nSkip  = &$AddNum "Skip Start (seconds)" "SkipSeconds" 0 300
+        $nWind  = &$AddNum "Window Duration (seconds)" "WindowSeconds" 10 600
+        $nFrame = &$AddNum "Thumbnail Count" "FrameCount" 1 50
+        $nGap   = &$AddNum "Jump Gap (minutes)" "JumpGapMinutes" 1 120
+        $nPar   = &$AddNum "Parallel FFmpeg Threads" "MaxParallelFfmpeg" 1 16
+        
+        $nPrevW = &$AddNum "Preview Width (px)" "PreviewWidth" 100 1920
+        $tDefF  = &$AddFolderBrowser "Default Folder" "DefaultFolder"
 
         $BtnSave = New-Object System.Windows.Forms.Button; $BtnSave.Text="Save"; $BtnSave.Top=$Layout.Top+20; $BtnSave.Left=120; $BtnSave.Width=100; $BtnSave.Height=35; $BtnSave.DialogResult="OK"; $SetForm.Controls.Add($BtnSave)
         $BtnCancel = New-Object System.Windows.Forms.Button; $BtnCancel.Text="Cancel"; $BtnCancel.Top=$Layout.Top+20; $BtnCancel.Left=240; $BtnCancel.Width=100; $BtnCancel.Height=35; $BtnCancel.DialogResult="Cancel"; $SetForm.Controls.Add($BtnCancel)
@@ -256,6 +290,8 @@ try {
             $Cfg["FrameCount"]            = [int]$nFrame.Value
             $Cfg["JumpGapMinutes"]        = [int]$nGap.Value
             $Cfg["MaxParallelFfmpeg"]     = [int]$nPar.Value
+            $Cfg["PreviewWidth"]          = [int]$nPrevW.Value
+            $Cfg["DefaultFolder"]         = $tDefF.Text.Trim()
             
             $NewContent = @("[SkyScribe Settings]")
             foreach ($k in $Cfg.Keys) { $NewContent += "$k=$($Cfg[$k])" }
@@ -342,6 +378,7 @@ try {
         $RefreshPeopleList = {
             $PeopleList.Items.Clear()
             $NameCounts.Clear()
+           
             $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
             
             if ($Config.RecursivePeopleSearch -eq 1) { 
@@ -472,7 +509,7 @@ try {
 
         if ($FFmpegPath) {
             if ($i -eq 0) {
-                Write-Host "      [SYNC] Generating initial thumbnails..." -ForegroundColor Yellow
+                Write-Host "       [SYNC] Generating initial thumbnails..." -ForegroundColor Yellow
                 $Job = Start-Job -ScriptBlock $PreviewJobScript -ArgumentList $FFmpegPath, $File.FullName, $Duration, $BaseTempPath, "0", $Config.SkipSeconds, $Config.WindowSeconds, $Config.FrameCount, $Config.PreviewWidth, $Config.MaxParallelFfmpeg
                 $ResultDir = $Job | Receive-Job -Wait -AutoRemoveJob
                 Log-Time "Thumbnail Gen" $Sw
@@ -546,7 +583,7 @@ try {
                     $SearchArgs["Recurse"] = $true 
                     $SearchArgs["Depth"] = $Config.RecursionDepth 
                 }
-                
+              
                 $TargetJump = $SuggestedJump.Trim()
                 $existing = Get-ChildItem @SearchArgs | Where-Object { $_.Name -like "#$TargetJump*" }
                 $max = 0; $FoundAny = $false
@@ -602,7 +639,7 @@ try {
         try {
             Rename-Item -Path $File.FullName -NewName $SanitizedName -ErrorAction Stop
             Log-Info "Renamed to: $SanitizedName"
-        } catch {
+         } catch {
             Log-Warn "Rename failed: $($_.Exception.Message)"
         }
     }
