@@ -1,7 +1,10 @@
 <# : batch portion
 @echo off
 cd /d "%~dp0"
-mode con: cols=100 lines=30
+if "%SS_LAUNCHED%"=="" (
+    set SS_LAUNCHED=1
+    mode con: cols=100 lines=30
+)
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression (Get-Content '%~f0' -Raw)"
 if %errorlevel% neq 0 pause
 exit /b
@@ -22,7 +25,10 @@ try {
     }
 
     function Clean-FileName($Name) {
-        return $Name -replace '[\\/:*?"<>|]', '-'
+        $Name = $Name -replace '[\\/:*?"<>|]', '-'
+        $Ext = [System.IO.Path]::GetExtension($Name)
+        $Base = [System.IO.Path]::GetFileNameWithoutExtension($Name).Trim(' .')
+        return "$Base$Ext"
     }
 
     Write-Host "`n=== SKYSCRIBE v3 (HUB EDITION) STARTED ===" -ForegroundColor Yellow
@@ -102,7 +108,11 @@ try {
                 }
 
                 if ($json.format.tags.creation_time) {
-                    $Result.Date = [DateTime]$json.format.tags.creation_time
+                    try {
+                        $Result.Date = [DateTime]$json.format.tags.creation_time
+                    } catch {
+                        Write-Host "[WARN]  Failed to parse creation_time '$($json.format.tags.creation_time)' for $([System.IO.Path]::GetFileName($FilePath)). Using LastWriteTime." -ForegroundColor Yellow
+                    }
                 }
             } catch {}
         }
@@ -144,7 +154,12 @@ try {
             $RunningProcs += $p
         }
         while (($RunningProcs | Where-Object { try { -not $_.HasExited } catch { $false } }).Count -gt 0) { Start-Sleep -Milliseconds 50 }
-        foreach ($p in $RunningProcs) { try { $p.Dispose() } catch {} }
+        $FailCount = 0
+        foreach ($p in $RunningProcs) { 
+            try { if ($p.ExitCode -ne 0) { $FailCount++ } } catch {} 
+            try { $p.Dispose() } catch {} 
+        }
+        if ($FailCount -gt 0) { Write-Warning "FFmpeg failed on $FailCount of $CfgFrames frames." }
         return $OutDir
     }
 
@@ -239,8 +254,14 @@ try {
             $Cfg["PreviewWidth"]          = [int]$nPrevW.Value
             $Cfg["DefaultFolder"]         = $tDefF.Text.Trim()
             
+            $IniKeyOrder = @(
+                "RecursivePeopleSearch", "RecursiveJumpSearch", "RecursionDepth",
+                "SkipSeconds", "WindowSeconds", "FrameCount", "JumpGapMinutes",
+                "VideoExtensions", "MinFileSizeKB", "PreviewWidth", "MaxParallelFfmpeg",
+                "DefaultFolder"
+            )
             $NewContent = @("[SkyScribe Settings]")
-            foreach ($k in $Cfg.Keys) { $NewContent += "$k=$($Cfg[$k])" }
+            foreach ($k in $IniKeyOrder) { if ($Cfg.ContainsKey($k)) { $NewContent += "$k=$($Cfg[$k])" } }
             $NewContent | Set-Content $Path -Force
         }
         $SetForm.Dispose()
@@ -303,6 +324,70 @@ try {
         &$AddLabel "Description:" 340; $DescIn = New-Object System.Windows.Forms.TextBox; $DescIn.Top = 365 + $YOffset; $DescIn.Left = 30; $DescIn.Width = 380; $DescIn.Text = $SuggestedDesc; $DescIn.Font = $FontStd
         $DescIn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
         $Form.Controls.Add($DescIn)
+
+        # Fill From File button
+        $FillBtn = New-Object System.Windows.Forms.Button
+        $FillBtn.Text = "Fill From File..."
+        $FillBtn.Top = 400 + $YOffset
+        $FillBtn.Left = 30
+        $FillBtn.Width = 180
+        $FillBtn.Height = 30
+        $FillBtn.Font = $FontStd
+        $FillBtn.Add_Click({
+            $PickDlg = New-Object System.Windows.Forms.OpenFileDialog
+            $PickDlg.Title = "Select a labeled video to copy info from"
+            $PickDlg.InitialDirectory = $TargetFolder
+            $PickDlg.Multiselect = $false
+            $FilterExts = $Config.VideoExtensions -replace ",", ";" -replace "\.", "*."
+            $PickDlg.Filter = "Video Files ($FilterExts)|$FilterExts|All Files (*.*)|*.*"
+            
+            if ($PickDlg.ShowDialog($Form) -eq "OK") {
+                $PickedName = [System.IO.Path]::GetFileName($PickDlg.FileName)
+                
+                $ParsedJump = ""; $ParsedDate = ""; $ParsedPeople = ""; $ParsedDesc = ""
+                
+                if ($PickedName -match "^#(\d+)(?:-\d+)?\s+(\d{4}_\d{2}_\d{2})\s+(.*?)(?:\s+-(.*))?\.") {
+                    $ParsedJump = $matches[1]
+                    $ParsedDate = $matches[2]
+                    $ParsedPeople = $matches[3].Trim()
+                    if ($matches.Count -gt 4 -and $matches[4]) { $ParsedDesc = $matches[4].Trim() }
+                } elseif ($PickedName -match "^#(\d+)(?:-\d+)?\s+(\d{4}_\d{2}_\d{2})") {
+                    $ParsedJump = $matches[1]
+                    $ParsedDate = $matches[2]
+                }
+                
+                if ($ParsedJump) {
+                    $DateIn.Text = $ParsedDate
+                    $JumpIn.Text = $ParsedJump
+                    $PeopleIn.Text = $ParsedPeople
+                    $DescIn.Text = $ParsedDesc
+                    
+                    # Calculate next clip number
+                    $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
+                    if ($Config.RecursiveJumpSearch -eq 1) { $SearchArgs["Recurse"] = $true; $SearchArgs["Depth"] = $Config.RecursionDepth }
+                    
+                    $TargetJump = $ParsedJump.Trim()
+                    $existing = Get-ChildItem @SearchArgs | Where-Object { $_.Name -like "#$TargetJump*" }
+                    $max = 0; $FoundAny = $false
+                    $EscapedJump = [regex]::Escape($TargetJump)
+                    
+                    foreach ($ex in $existing) {
+                        $FoundAny = $true
+                        if ($ex.Name -match "^#$EscapedJump-(\d+)") { 
+                            $val = [int]$matches[1]; if ($val -gt $max) { $max = $val } 
+                        }
+                    }
+                    
+                    if ($max -gt 0) { $ClipIn.Text = ($max + 1).ToString() } 
+                    elseif ($FoundAny) { $ClipIn.Text = "2" } 
+                    else { $ClipIn.Text = "1" }
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show("Could not parse naming info from:`n$PickedName`n`nExpected format: #Jump Date People -Desc.ext", "Parse Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                }
+            }
+            $PickDlg.Dispose()
+        })
+        $Form.Controls.Add($FillBtn)
 
         # Recent People
         &$AddLabel "RECENT PEOPLE (Double-Click):" 20 460
@@ -436,7 +521,7 @@ try {
             }
         }
 
-        $FFprobePath = $FFmpegPath.Replace("ffmpeg.exe", "ffprobe.exe")
+        $FFprobePath = $FFmpegPath -ireplace 'ffmpeg\.exe$', 'ffprobe.exe'
         if (-not (Test-Path $FFprobePath)) {
             if (Get-Command "ffprobe" -ErrorAction SilentlyContinue) { $FFprobePath = (Get-Command "ffprobe").Source }
             else { Log-Warn "FFprobe not found. Metadata reading will be limited." }
@@ -452,7 +537,7 @@ try {
             $FilesWithDates += [PSCustomObject]@{ FileObject = $File; SortDate = $Meta.Date; Duration = $Meta.Duration }
         }
         
-        $SortedQueue = $FilesWithDates | Sort-Object SortDate
+        $SortedQueue = @($FilesWithDates | Sort-Object SortDate)
         $LastJump = ""; $LastJumpTime = $null; $LastPeople = ""; $LastDesc = ""
         $NextJob = $null; $BaseTempPath = Join-Path $env:TEMP "SkydivePreviews"
         
@@ -511,8 +596,11 @@ try {
 
             if (-not $JumpFoundInSession -and $Config.RecursiveJumpSearch -eq 1) {
                  Log-Info "Scanning folder for existing jumps..."
-                 $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true; Recurse = $true }
-                 if ($Config.RecursiveJumpSearch -eq 1) { $SearchArgs["Depth"] = $Config.RecursionDepth }
+                 $SearchArgs = @{ LiteralPath = $TargetFolder; File = $true }
+                 if ($Config.RecursiveJumpSearch -eq 1) { 
+                     $SearchArgs["Recurse"] = $true
+                     $SearchArgs["Depth"] = $Config.RecursionDepth 
+                 }
 
                  $Candidates = Get-ChildItem @SearchArgs | Where-Object { $_.Name -match "^#\d+" }
                  $BestMatch = $null; $SmallestGap = [double]::MaxValue
@@ -571,7 +659,13 @@ try {
 
             if ($null -eq $Data) { Log-Info "Skipped (Null Data)."; continue }
             
-            if ($Data.Status -eq "ABORT") { Log-Info "Exited processing early. Returning to Hub."; break }
+            if ($Data.Status -eq "ABORT") { 
+                if ($NextJob) { 
+                    try { Stop-Job $NextJob -ErrorAction SilentlyContinue; Remove-Job $NextJob -Force -ErrorAction SilentlyContinue } catch {} 
+                    $NextJob = $null
+                }
+                Log-Info "Exited processing early. Returning to Hub."; break 
+            }
             if ($Data.Status -eq "SKIP") { Log-Info "Skipped."; continue }
 
             $LastJump = $Data.Jump; $LastPeople = $Data.People; $LastDesc = $Data.Desc; $LastJumpTime = $CurrentMediaTime
